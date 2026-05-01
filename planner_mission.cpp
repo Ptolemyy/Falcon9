@@ -219,18 +219,29 @@ Stage1Result simulate_stage1_candidate(
             }
             if (q < 0.80 * q_target_kpa && t > q_target_time_s + 6.0) throttle_cmd = 1.0;
         } else {
-            PolarState pseudo;
-            pseudo.r = kRe + std::max(0.0, s.z);
-            pseudo.theta = s.x / kRe;
-            pseudo.vr = s.vz;
-            pseudo.vt = s.vx;
-            pseudo.m = s.m;
-            const UpfgCommand cmd = upfg_compute_command(pseudo, upfg_vehicle, upfg_target, upfg_settings, upfg_prev_tgo, dt);
-            upfg_prev_tgo = cmd.tgo_s;
-            out.tgo_final_s = cmd.tgo_s;
-            out.vgo_final_mps = cmd.vgo_mps;
-            gamma_raw = cmd.gamma_cmd_rad;
-            throttle_cmd = clampd(cmd.throttle, 0.25, 1.0);
+            // Max-payload experiment: do not hand stage 1 to UPFG late in the burn.
+            // Keep the early pitch/gravity-turn program, then use a small ZEM/ZEV-like
+            // terminal correction to nudge the booster toward the requested separation
+            // altitude, speed, and flight-path angle.  In the current planner this
+            // retains much more stage-1 recovery propellant than the UPFG handoff.
+            const double target_z = target.sep_alt_km * 1000.0;
+            const double target_vz = target.sep_speed_mps * std::sin(deg2rad(target.sep_gamma_deg));
+            const double target_vx = target.sep_speed_mps * std::cos(deg2rad(target.sep_gamma_deg));
+            const double tgo = clampd(burn_s - t, 6.0, 80.0);
+            const double ax_need = clampd((target_vx - s.vx) / tgo, -25.0, 25.0);
+            const double az_need = clampd(
+                (target_vz - s.vz) / tgo +
+                    2.0 * (target_z - s.z - s.vz * tgo) / std::max(1.0, tgo * tgo),
+                -25.0,
+                35.0);
+            const double thrust_acc_max = thrust / std::max(1.0, s.m);
+            const double thrust_ax_cmd = ax_need + drag_ax;
+            const double thrust_az_cmd = az_need + g + drag_az;
+            gamma_raw = std::atan2(std::max(0.0, thrust_az_cmd), std::max(1e-4, thrust_ax_cmd));
+            const double acc_cmd = std::hypot(thrust_ax_cmd, thrust_az_cmd);
+            throttle_cmd = clampd(acc_cmd / std::max(1e-6, thrust_acc_max), 0.35, 1.0);
+            out.tgo_final_s = tgo;
+            out.vgo_final_mps = std::hypot(target_vx - s.vx, target_vz - s.vz);
         }
 
         if (t < 5.0) gamma_raw = deg2rad(89.2);
