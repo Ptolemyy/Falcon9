@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(build/planner_smoke.exe 200 200 28.5 12000 0)",
+      "Bash(build/planner_smoke.exe --coarse1s 200 200 28.5 12000 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 0 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 5000 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 8000 0)",
+      "Bash(build/planner_smoke.exe --max-payload 200 200 28.5 0)",
+      "Bash(\"C:/Users/32796/AppData/Local/Programs/Python/Python311/Scripts/ninja.exe\" -C build planner_smoke)",
+      "Bash(build/planner_smoke.exe --burnout 200 200 28.5 12000 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 15000 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 4000 0)",
+      "Bash(build/planner_smoke.exe 200 200 28.5 10000 0)",
+      "Bash(./planner_smoke.exe)",
+      "Bash(ninja --version)",
+      "Bash(ninja planner_smoke)",
+      "Bash(ninja clean *)",
+      "Bash(cl /std:c++17 /nologo /EHsc /MD /Fe:tmp_recovery_probe.exe tmp_recovery_probe.cpp CMakeFiles/planner_smoke.dir/planner_mission.cpp.obj CMakeFiles/planner_smoke.dir/planner_recovery.cpp.obj CMakeFiles/planner_smoke.dir/planner_upfg.cpp.obj)",
+      "Bash(timeout 120 ./planner_smoke.exe --coarse1s 550 550 43 12000 0)",
+      "Bash(cmake -G Ninja .)",
+      "Bash(ninja rec_probe)",
+      "Bash(./rec_probe.exe)",
+      "Bash(ninja rec_probe planner_smoke)",
+      "Bash(timeout 30 ./planner_smoke.exe *)",
+      "Bash(ninja)",
+      "Bash(timeout 60 ./planner_smoke.exe --coarse1s 200 200 28.5 12000 0)",
+      "Bash(timeout 120 ./planner_smoke.exe --coarse1s 200 200 28.5 12000 0)",
+      "Bash(awk 'BEGIN{FS=\" \"} /scenario/ { *)",
+      "Bash(timeout 90 ./planner_smoke.exe 200 200 28.5 8000 0)",
+      "Bash(timeout 120 ./planner_smoke.exe 200 200 28.5 8000 0)",
+      "Bash(timeout 300 ./planner_smoke.exe --max-payload 200 200 28.5 0)"
+    ]
+  }
+}

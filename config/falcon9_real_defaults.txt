@@ -1,0 +1,32 @@
+# Falcon 9 Block 5 baseline configuration (publicly reported approximate values).
+# Note: payload default is tuned for this simplified planner's orbit+recovery feasibility.
+# Units:
+#   mass: kg, thrust: kN, isp: s, angles: deg, distance: km.
+
+payload_kg=12000
+perigee_km=200
+apogee_km=200
+cutoff_alt_km=200
+incl_deg=28.5
+
+lat_deg=28.561857
+launch_lon_deg=-80.577366
+ship_downrange_km=620
+losses_mps=1500
+q_limit_kpa=45
+s1_target_maxq_kpa=35
+s1_target_meco_s=145
+s1_sep_delay_s=3
+
+s1_dry_kg=25600
+s1_prop_kg=411000
+s1_isp_s=282
+s1_thrust_kN=7607
+s1_reserve=0.0
+
+s2_dry_kg=4000
+s2_prop_kg=107500
+s2_isp_s=348
+s2_thrust_kN=981
+s2_ignition_delay_s=7
+s2_target_seco_s=529

@@ -1,0 +1,344 @@
+#pragma once
+
+#define NOMINMAX
+#include <windows.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <string>
+#include <vector>
+
+namespace falcon9 {
+
+constexpr double kG0 = 9.80665;
+constexpr double kRe = 6378137.0;
+constexpr double kMu = 3.986004418e14;
+constexpr double kMuKm = 3.986004418e5;
+constexpr double kOmega = 7.2921159e-5;
+
+inline double clampd(double v, double lo, double hi) {
+    return std::max(lo, std::min(hi, v));
+}
+
+inline double lerpd(double a, double b, double u) {
+    return a + (b - a) * u;
+}
+
+inline double smoothstep(double edge0, double edge1, double x) {
+    if (edge1 <= edge0) return (x >= edge1) ? 1.0 : 0.0;
+    const double u = clampd((x - edge0) / (edge1 - edge0), 0.0, 1.0);
+    return u * u * (3.0 - 2.0 * u);
+}
+
+inline double deg2rad(double d) {
+    return d * 3.14159265358979323846 / 180.0;
+}
+
+inline double rad2deg(double r) {
+    return r * 180.0 / 3.14159265358979323846;
+}
+
+inline double grav(double alt_m) {
+    const double r = kRe + std::max(0.0, alt_m);
+    return kMu / std::max(1.0, r * r);
+}
+
+inline double rho(double alt_m) {
+    const double h = std::max(0.0, alt_m);
+    if (h > 120000.0) return 0.0;
+    return 1.225 * std::exp(-h / 8500.0);
+}
+
+inline double wrap_lon_deg(double lon_deg) {
+    double out = lon_deg;
+    while (out > 180.0) out -= 360.0;
+    while (out < -180.0) out += 360.0;
+    return out;
+}
+
+inline void destination_from_course(
+    double lat1_deg,
+    double lon1_deg,
+    double az_deg,
+    double dist_km,
+    double& lat2_deg,
+    double& lon2_deg) {
+    const double r_earth_km = kRe / 1000.0;
+    const double sigma = dist_km / std::max(1e-6, r_earth_km);
+    const double lat1 = deg2rad(lat1_deg);
+    const double lon1 = deg2rad(lon1_deg);
+    const double az = deg2rad(az_deg);
+
+    const double sin_lat1 = std::sin(lat1);
+    const double cos_lat1 = std::cos(lat1);
+    const double sin_sigma = std::sin(sigma);
+    const double cos_sigma = std::cos(sigma);
+
+    const double sin_lat2 = sin_lat1 * cos_sigma + cos_lat1 * sin_sigma * std::cos(az);
+    const double lat2 = std::asin(clampd(sin_lat2, -1.0, 1.0));
+
+    const double y = std::sin(az) * sin_sigma * cos_lat1;
+    const double x = cos_sigma - sin_lat1 * std::sin(lat2);
+    const double lon2 = lon1 + std::atan2(y, x);
+
+    lat2_deg = rad2deg(lat2);
+    lon2_deg = wrap_lon_deg(rad2deg(lon2));
+}
+
+inline double prop_for_dv(double m0, double dv, double isp) {
+    if (dv <= 0.0 || isp <= 1e-6 || m0 <= 1.0) return 0.0;
+    const double mf = m0 / std::exp(dv / (isp * kG0));
+    return std::max(0.0, m0 - mf);
+}
+
+struct Vec3 {
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+inline double dot3(const Vec3& a, const Vec3& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline Vec3 cross3(const Vec3& a, const Vec3& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
+inline Vec3 normalize3(const Vec3& v) {
+    const double n = std::sqrt(dot3(v, v));
+    if (n <= 1e-12) return {0.0, 0.0, 0.0};
+    return {v.x / n, v.y / n, v.z / n};
+}
+
+inline Vec3 ecef_from_geo(double lat_deg, double lon_deg, double alt_km) {
+    const double lat = deg2rad(lat_deg);
+    const double lon = deg2rad(lon_deg);
+    const double r = 1.0 + alt_km / (kRe / 1000.0);
+    const double cos_lat = std::cos(lat);
+    return {
+        r * cos_lat * std::cos(lon),
+        r * cos_lat * std::sin(lon),
+        r * std::sin(lat),
+    };
+}
+
+struct MissionRequest {
+    double payload_kg = 15000.0;
+    double perigee_km = 200.0;
+    double apogee_km = 200.0;
+    double cutoff_alt_km = std::numeric_limits<double>::quiet_NaN();
+    double incl_deg = 28.5;
+    double lat_deg = 28.5;
+    double launch_lon_deg = -80.6;
+    double ship_downrange_km = 620.0;
+    double losses_mps = 1500.0;
+    double q_limit_kpa = 45.0;
+    double s1_target_maxq_kpa = 35.0;
+    double s1_target_meco_s = 145.0;
+    double s1_sep_delay_s = 3.0;
+    double s1_dry_kg = 25600.0;
+    double s1_prop_kg = 395700.0;
+    double s1_isp_s = 282.0;
+    double s1_thrust_kN = 7607.0;
+    double s1_reserve = 0.0;
+    double s2_dry_kg = 4000.0;
+    double s2_prop_kg = 92670.0;
+    double s2_isp_s = 348.0;
+    double s2_thrust_kN = 981.0;
+    double s2_ignition_delay_s = 7.0;
+    double s2_target_seco_s = 529.0;
+};
+
+struct PlotPt {
+    double x_km = 0.0;
+    double y_km = 0.0;
+};
+
+struct Series {
+    std::wstring name;
+    COLORREF color = RGB(0, 0, 0);
+    std::vector<PlotPt> pts;
+};
+
+struct GlobePt {
+    double lat_deg = 0.0;
+    double lon_deg = 0.0;
+    double alt_km = 0.0;
+};
+
+struct GlobeSeries {
+    std::wstring name;
+    COLORREF color = RGB(0, 0, 0);
+    std::vector<GlobePt> pts;
+};
+
+struct SimPt {
+    double t = 0.0;
+    double x_km = 0.0;
+    double z_km = 0.0;
+};
+
+struct PolarState {
+    double r = kRe;
+    double theta = 0.0;
+    double vr = 0.0;
+    double vt = 0.0;
+    double m = 0.0;
+};
+
+struct OrbitMetrics {
+    double rp_km = 0.0;
+    double ra_km = 0.0;
+    double a_km = 0.0;
+    double e = 0.0;
+    double speed_mps = 0.0;
+    double flight_path_deg = 0.0;
+};
+
+struct OrbitTarget {
+    double rp_km = 0.0;
+    double ra_km = 0.0;
+    double cutoff_alt_km = 0.0;
+    double launch_az_deg = 90.0;
+    double r_target_m = kRe;
+    double vr_target_mps = 0.0;
+    double vt_target_mps = 0.0;
+    double speed_target_mps = 0.0;
+    double fpa_target_deg = 0.0;
+};
+
+struct Stage1Result {
+    PolarState meco;
+    PolarState sep;
+    double burn_s = 0.0;
+    double meco_s = 0.0;
+    double sep_s = 0.0;
+    double guide_start_s = 0.0;
+    double used_prop = 0.0;
+    double rem_prop = 0.0;
+    double max_q = 0.0;
+    double t_max_q = 0.0;
+    double min_throttle = 1.0;
+    double t_min_throttle = 0.0;
+    bool converged = false;
+    bool envelope_ok = false;
+    double target_alt_err_km = 0.0;
+    double target_speed_err_mps = 0.0;
+    double target_gamma_err_deg = 0.0;
+    double tgo_final_s = 0.0;
+    double vgo_final_mps = 0.0;
+    std::vector<SimPt> traj;
+};
+
+struct Stage2Result {
+    PolarState ignition;
+    PolarState seco;
+    OrbitMetrics orbit;
+    double ignition_s = 0.0;
+    double burn_s = 0.0;
+    double cutoff_s = 0.0;
+    double used_prop = 0.0;
+    double rem_prop = 0.0;
+    double target_r_err_km = 0.0;
+    double target_rp_err_km = 0.0;
+    double target_ra_err_km = 0.0;
+    double target_fpa_err_deg = 0.0;
+    double peak_alt_km = 0.0;
+    double orbit_penalty = std::numeric_limits<double>::infinity();
+    bool converged = false;
+    bool orbit_ok = false;
+    double tgo_final_s = 0.0;
+    double vgo_final_mps = 0.0;
+    std::vector<SimPt> traj;
+};
+
+struct RecoveryResult {
+    bool feasible = false;
+    bool converged = false;
+    double landing_ignition_time_s = std::numeric_limits<double>::quiet_NaN();
+    double landing_prop_kg = 0.0;
+    double touchdown_time_s = 0.0;
+    double touchdown_downrange_km = 0.0;
+    double touchdown_lat_deg = 0.0;
+    double touchdown_lon_deg = 0.0;
+    double margin_kg = -std::numeric_limits<double>::infinity();
+    double touchdown_speed_mps = 0.0;
+    std::vector<SimPt> coast_traj;
+    std::vector<SimPt> landing_traj;
+};
+
+struct SeparationCandidate {
+    double sep_time_s = 0.0;
+    double sep_alt_target_km = 0.0;
+    double sep_speed_target_mps = 0.0;
+    double sep_gamma_target_deg = 0.0;
+    Stage1Result stage1;
+    Stage2Result stage2;
+    RecoveryResult recovery;
+    bool feasible = false;
+    double orbit_miss_score = std::numeric_limits<double>::infinity();
+    double recovery_surplus_kg = std::numeric_limits<double>::infinity();
+    double score = std::numeric_limits<double>::infinity();
+};
+
+struct MissionResult {
+    bool ok = false;
+    bool payload_search_ok = false;
+    std::wstring status;
+    std::vector<std::wstring> lines;
+    std::vector<Series> profile_series;
+    std::vector<Series> separation_time_series;
+    std::vector<SeparationCandidate> separation_candidates;
+    std::vector<GlobeSeries> globe_series;
+    double launch_lat_deg = 0.0;
+    double launch_lon_deg = -80.6;
+    double ship_lat_deg = 0.0;
+    double ship_lon_deg = -80.0;
+    double view_lat_deg = 20.0;
+    double view_lon_deg = -60.0;
+    OrbitTarget orbit_target;
+    SeparationCandidate best_candidate;
+    Stage1Result stage1;
+    Stage2Result stage2;
+    RecoveryResult recovery;
+};
+
+enum class SeparationSearchMode {
+    RefinedDefault,
+    Coarse1s,
+};
+
+struct SolveControl {
+    const std::atomic<bool>* cancel_requested = nullptr;
+    unsigned worker_count = 0;
+    SeparationSearchMode separation_search_mode = SeparationSearchMode::RefinedDefault;
+    bool ignore_recovery = false;
+    bool force_stage1_burnout = false;
+};
+
+OrbitMetrics orbit_metrics_from_state(const PolarState& s);
+OrbitTarget build_orbit_target(const MissionRequest& request);
+MissionRequest sanitize_request(const MissionRequest& request);
+MissionResult solve_mission(const MissionRequest& request, SolveControl control = {});
+
+inline bool finite_plot_pt(const PlotPt& p) {
+    return std::isfinite(p.x_km) && std::isfinite(p.y_km);
+}
+
+inline bool finite_globe_pt(const GlobePt& p) {
+    return std::isfinite(p.lat_deg) && std::isfinite(p.lon_deg) && std::isfinite(p.alt_km);
+}
+
+inline bool mission_payload_search_ok(const MissionResult& result) {
+    return result.payload_search_ok;
+}
+
+}  // namespace falcon9

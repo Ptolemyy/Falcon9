@@ -62,32 +62,78 @@ FUNCTION WRITE_KVS {
   LOG KEY + "=" + VALTXT TO SEND_FILE.
 }.
 
+FUNCTION IS_S1_ENGINE_NAME {
+  PARAMETER PARTNAME.
+  IF PARTNAME = "TE.19.F9.S1.Engine" { RETURN 1. }.
+  IF PARTNAME = "PMB.F9.Merlin1Dplusplus" { RETURN 1. }.
+  RETURN 0.
+}.
+
+FUNCTION IS_S2_ENGINE_NAME {
+  PARAMETER PARTNAME.
+  IF PARTNAME = "TE.19.F9.S2.Engine" { RETURN 1. }.
+  IF PARTNAME = "PMB.F9.Merlin1DVplus" { RETURN 1. }.
+  RETURN 0.
+}.
+
+FUNCTION IS_STAGE_SEPARATOR_NAME {
+  PARAMETER PARTNAME.
+  IF PARTNAME = "Decoupler.3" { RETURN 1. }.
+  RETURN 0.
+}.
+
+FUNCTION IS_PAYLOAD_SEPARATOR_NAME {
+  PARAMETER PARTNAME.
+  IF PARTNAME = "Decoupler.2" { RETURN 1. }.
+  RETURN 0.
+}.
+
 FUNCTION IS_S1_PART {
   PARAMETER P.
   LOCAL N IS P:NAME.
-  IF N = "TE.19.F9.S1.Engine" { RETURN 1. }.
+  IF IS_S1_ENGINE_NAME(N) = 1 { RETURN 1. }.
   IF N = "TE.19.F9.S1.Tank" { RETURN 1. }.
   IF N = "TE.19.F9.S1.Interstage" { RETURN 1. }.
   IF N = "KRE-FalconLegMk2-M" { RETURN 1. }.
   IF N = "Grid Fin M Titanium" { RETURN 1. }.
   IF N = "TE2.19.F9.CGT" { RETURN 1. }.
+  IF N = "KK.SPX.F93.interstage" { RETURN 1. }.
+  IF N = "KK.SPX.F93.S1tank" { RETURN 1. }.
+  IF N = "PMB.Rockomax16.BW" { RETURN 1. }.
+  IF N = "KK.SPX.F9.Octaweb" { RETURN 1. }.
+  IF N = "Vandy.F9" { RETURN 1. }.
+  IF N = "KK.F9demo.S1RCS" { RETURN 1. }.
+  IF N = "Grid Fin L Titanium" { RETURN 1. }.
+  IF N = "KK.SPX.F9LandingLeg" { RETURN 1. }.
+  IF N = "miniFuelTank" { RETURN 1. }.
   RETURN 0.
 }.
 
 FUNCTION IS_S2_PART {
   PARAMETER P.
   LOCAL N IS P:NAME.
-  IF N = "TE.19.F9.S2.Engine" { RETURN 1. }.
+  IF IS_S2_ENGINE_NAME(N) = 1 { RETURN 1. }.
   IF N = "TE.19.F9.S2.Tank" { RETURN 1. }.
   IF N = "TE.F9.S2.RCS" { RETURN 1. }.
   IF N = "TE.F9.Fairing.Adapter" { RETURN 1. }.
   IF N = "TE.19.F9.Fairing" { RETURN 1. }.
+  IF N = "KK.SPX.F93.S2tank" { RETURN 1. }.
+  IF N = "KK.SpX.Mvac.skirt" { RETURN 1. }.
+  IF N = "linearRcs" { RETURN 1. }.
+  IF N = "KK.SPX.FalconPayloadFairing" { RETURN 1. }.
+  IF N = "KK.SpX.FRH" { RETURN 1. }.
+  IF N = "Decoupler.3" { RETURN 1. }.
+  IF N = "Decoupler.2" { RETURN 1. }.
+  IF N = "asasmodule1-2" { RETURN 1. }.
+  IF N = "KK.SPX.F9.1875mmPA" { RETURN 1. }.
+  IF N = "KK.SPX.Falcon9.FC" { RETURN 1. }.
   RETURN 0.
 }.
 
 FUNCTION IS_IGNORE_PART {
   PARAMETER P.
   IF P:NAME = "TE.Ghidorah.Erector" { RETURN 1. }.
+  IF P:NAME = "launchClamp1" { RETURN 1. }.
   RETURN 0.
 }.
 
@@ -99,23 +145,105 @@ FUNCTION IS_TRUE_TEXT {
   RETURN 0.
 }.
 
+FUNCTION BRANCH_HAS_ENGINE {
+  PARAMETER ROOT.
+  PARAMETER WANT_S1.
+  PARAMETER WANT_S2.
+
+  IF WANT_S1 = 1 {
+    IF IS_S1_ENGINE_NAME(ROOT:NAME) = 1 { RETURN 1. }.
+    IF ROOT:PARTSNAMED("TE.19.F9.S1.Engine"):LENGTH > 0 { RETURN 1. }.
+    IF ROOT:PARTSNAMED("PMB.F9.Merlin1Dplusplus"):LENGTH > 0 { RETURN 1. }.
+  }.
+
+  IF WANT_S2 = 1 {
+    IF IS_S2_ENGINE_NAME(ROOT:NAME) = 1 { RETURN 1. }.
+    IF ROOT:PARTSNAMED("TE.19.F9.S2.Engine"):LENGTH > 0 { RETURN 1. }.
+    IF ROOT:PARTSNAMED("PMB.F9.Merlin1DVplus"):LENGTH > 0 { RETURN 1. }.
+  }.
+
+  RETURN 0.
+}.
+
+FUNCTION IS_DESCENDANT_OF {
+  PARAMETER P.
+  PARAMETER ROOT.
+
+  LOCAL CUR IS P.
+  UNTIL CUR:HASPARENT = FALSE {
+    IF CUR = ROOT { RETURN 1. }.
+    SET CUR TO CUR:PARENT.
+  }.
+
+  IF CUR = ROOT { RETURN 1. }.
+  RETURN 0.
+}.
+
+FUNCTION IS_IN_CHILD_BRANCH_OF {
+  PARAMETER P.
+  PARAMETER SEP.
+
+  FOR C IN SEP:CHILDREN {
+    IF IS_DESCENDANT_OF(P, C) = 1 { RETURN 1. }.
+  }.
+
+  RETURN 0.
+}.
+
 // Part-name based engine model lookup (works even if engine module is not enabled).
 FUNCTION GET_ENGINE_MODEL_THRUST_KN {
   PARAMETER PARTNAME.
   IF PARTNAME = "TE.19.F9.S1.Engine" { RETURN 7607. }.
+  IF PARTNAME = "PMB.F9.Merlin1Dplusplus" { RETURN 845.222222. }.
   IF PARTNAME = "TE.19.F9.S2.Engine" { RETURN 981. }.
+  IF PARTNAME = "PMB.F9.Merlin1DVplus" { RETURN 981. }.
   RETURN 0.
 }.
 
 FUNCTION GET_ENGINE_MODEL_ISP_S {
   PARAMETER PARTNAME.
   IF PARTNAME = "TE.19.F9.S1.Engine" { RETURN 282.0. }.
+  IF PARTNAME = "PMB.F9.Merlin1Dplusplus" { RETURN 282.0. }.
   IF PARTNAME = "TE.19.F9.S2.Engine" { RETURN 348.0. }.
+  IF PARTNAME = "PMB.F9.Merlin1DVplus" { RETURN 348.0. }.
   RETURN 0.
 }.
 
 // ---- Parts and mass collection (no tags needed) ----
 LIST PARTS IN ALL_PARTS.
+LOCAL STAGE_SEPARATOR IS SHIP:ROOTPART.
+LOCAL PAYLOAD_SEPARATOR IS SHIP:ROOTPART.
+LOCAL STAGE_SEPARATOR_FOUND IS 0.
+LOCAL PAYLOAD_SEPARATOR_FOUND IS 0.
+
+FOR P IN ALL_PARTS {
+  IF STAGE_SEPARATOR_FOUND = 0 {
+    IF IS_STAGE_SEPARATOR_NAME(P:NAME) = 1 {
+      FOR C IN P:CHILDREN {
+        IF BRANCH_HAS_ENGINE(C, 1, 0) = 1 {
+          SET STAGE_SEPARATOR TO P.
+          SET STAGE_SEPARATOR_FOUND TO 1.
+        }.
+      }.
+    }.
+  }.
+
+  IF PAYLOAD_SEPARATOR_FOUND = 0 {
+    IF IS_PAYLOAD_SEPARATOR_NAME(P:NAME) = 1 {
+      LOCAL CHILD_HAS_MAIN_ENGINE IS 0.
+      FOR C IN P:CHILDREN {
+        IF BRANCH_HAS_ENGINE(C, 1, 1) = 1 {
+          SET CHILD_HAS_MAIN_ENGINE TO 1.
+        }.
+      }.
+      IF CHILD_HAS_MAIN_ENGINE = 0 {
+        SET PAYLOAD_SEPARATOR TO P.
+        SET PAYLOAD_SEPARATOR_FOUND TO 1.
+      }.
+    }.
+  }.
+}.
+
 LOCAL S1_WET_KG IS 0.
 LOCAL S1_DRY_KG IS 0.
 LOCAL S2_WET_KG IS 0.
@@ -128,14 +256,49 @@ FOR P IN ALL_PARTS {
   } ELSE {
     LOCAL WET_KG IS PART_WET_MASS_KG(P).
     LOCAL DRY_KG IS PART_DRY_MASS_KG(P).
-    IF IS_S1_PART(P) = 1 {
+    LOCAL MATCHED_S1 IS 0.
+    LOCAL MATCHED_PAYLOAD IS 0.
+
+    IF STAGE_SEPARATOR_FOUND = 1 {
+      IF IS_IN_CHILD_BRANCH_OF(P, STAGE_SEPARATOR) = 1 {
+        SET MATCHED_S1 TO 1.
+      }.
+    } ELSE {
+      IF IS_S1_PART(P) = 1 {
+        SET MATCHED_S1 TO 1.
+      }.
+    }.
+
+    IF PAYLOAD_SEPARATOR_FOUND = 1 {
+      IF IS_IN_CHILD_BRANCH_OF(P, PAYLOAD_SEPARATOR) = 1 {
+        SET MATCHED_PAYLOAD TO 1.
+      }.
+    }.
+
+    IF MATCHED_S1 = 1 {
       SET S1_WET_KG TO S1_WET_KG + WET_KG.
       SET S1_DRY_KG TO S1_DRY_KG + DRY_KG.
-    } ELSE IF IS_S2_PART(P) = 1 {
-      SET S2_WET_KG TO S2_WET_KG + WET_KG.
-      SET S2_DRY_KG TO S2_DRY_KG + DRY_KG.
     } ELSE {
-      SET PAYLOAD_KG TO PAYLOAD_KG + WET_KG.
+      IF MATCHED_PAYLOAD = 1 {
+        SET PAYLOAD_KG TO PAYLOAD_KG + WET_KG.
+      } ELSE {
+        IF STAGE_SEPARATOR_FOUND = 1 {
+          IF PAYLOAD_SEPARATOR_FOUND = 1 {
+            SET S2_WET_KG TO S2_WET_KG + WET_KG.
+            SET S2_DRY_KG TO S2_DRY_KG + DRY_KG.
+          } ELSE IF IS_S2_PART(P) = 1 {
+            SET S2_WET_KG TO S2_WET_KG + WET_KG.
+            SET S2_DRY_KG TO S2_DRY_KG + DRY_KG.
+          } ELSE {
+            SET PAYLOAD_KG TO PAYLOAD_KG + WET_KG.
+          }.
+        } ELSE IF IS_S2_PART(P) = 1 {
+          SET S2_WET_KG TO S2_WET_KG + WET_KG.
+          SET S2_DRY_KG TO S2_DRY_KG + DRY_KG.
+        } ELSE {
+          SET PAYLOAD_KG TO PAYLOAD_KG + WET_KG.
+        }.
+      }.
     }.
   }.
 }.
@@ -158,14 +321,26 @@ LOCAL S2_THRUST_SOURCE IS "default".
 LOCAL S1_ISP_SOURCE IS "default".
 LOCAL S2_ISP_SOURCE IS "default".
 
+IF STAGE_SEPARATOR_FOUND = 1 {
+  SET S1_MASS_SOURCE TO "decoupler_child_branch".
+  IF PAYLOAD_SEPARATOR_FOUND = 1 {
+    SET S2_MASS_SOURCE TO "upper_stack_minus_payload_branch".
+    SET PAYLOAD_SOURCE TO "payload_decoupler_child_branch".
+  } ELSE {
+    SET S2_MASS_SOURCE TO "decoupler_plus_partname_fallback".
+  }.
+} ELSE IF PAYLOAD_SEPARATOR_FOUND = 1 {
+  SET PAYLOAD_SOURCE TO "payload_decoupler_child_branch".
+}.
+
 FOR P IN ALL_PARTS {
-  IF P:NAME = "TE.19.F9.S1.Engine" {
+  IF IS_S1_ENGINE_NAME(P:NAME) = 1 {
     SET S1_ENGINE_COUNT TO S1_ENGINE_COUNT + 1.
     SET S1_THRUST_KN TO S1_THRUST_KN + GET_ENGINE_MODEL_THRUST_KN(P:NAME).
     SET S1_ISP_S TO GET_ENGINE_MODEL_ISP_S(P:NAME).
     SET S1_THRUST_SOURCE TO "partname_engine_model".
     SET S1_ISP_SOURCE TO "partname_engine_model".
-  } ELSE IF P:NAME = "TE.19.F9.S2.Engine" {
+  } ELSE IF IS_S2_ENGINE_NAME(P:NAME) = 1 {
     SET S2_ENGINE_COUNT TO S2_ENGINE_COUNT + 1.
     SET S2_THRUST_KN TO S2_THRUST_KN + GET_ENGINE_MODEL_THRUST_KN(P:NAME).
     SET S2_ISP_S TO GET_ENGINE_MODEL_ISP_S(P:NAME).
@@ -235,6 +410,8 @@ WRITE_KV("s2_thrust_kN", S2_THRUST_KN).
 WRITE_KVS("s1_mass_source", S1_MASS_SOURCE).
 WRITE_KVS("s2_mass_source", S2_MASS_SOURCE).
 WRITE_KVS("payload_source", PAYLOAD_SOURCE).
+WRITE_KV("stage_separator_found", STAGE_SEPARATOR_FOUND).
+WRITE_KV("payload_separator_found", PAYLOAD_SEPARATOR_FOUND).
 WRITE_KVS("s1_thrust_source", S1_THRUST_SOURCE).
 WRITE_KVS("s2_thrust_source", S2_THRUST_SOURCE).
 WRITE_KVS("s1_isp_source", S1_ISP_SOURCE).
