@@ -60,7 +60,9 @@ LandingPhaseResult simulate_landing_phase(
         s.m = request.s1_dry_kg + std::max(0.0, prop_budget_kg);
     }
 
-    const double thrust_max = request.s1_thrust_kN * 1000.0;
+    // Landing burn should be constrained to one Merlin, not all 9 first-stage engines.
+    // request.s1_thrust_kN is the full stage-1 sea-level thrust, so use 1/9 here.
+    const double thrust_max = (request.s1_thrust_kN * 1000.0) / 9.0;
     const double throttle_min = 0.15;
     // Terminal phase hover authority: below this altitude the guidance is
     // allowed to throttle all the way down to match real single-engine hover
