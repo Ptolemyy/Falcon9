@@ -76,6 +76,11 @@ add_generated_backend(
     "${GFOLD_SOLVER_DIR}/GFOLD_solver_100.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/p4_n100/c"
 )
+add_generated_backend(
+    gfold_solver_backend_2d_n50
+    "${GFOLD_SOLVER_DIR}/GFOLD_solver_2d_n50.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/p4_n50_2d_free_x/c"
+)
 
 add_library(gfold_solver_router STATIC
     "${GFOLD_SOLVER_DIR}/GFOLD_solver.cpp"
@@ -93,6 +98,7 @@ target_link_libraries(gfold_solver_router PUBLIC
     gfold_solver_backend_n25
     gfold_solver_backend_n50
     gfold_solver_backend_n100
+    gfold_solver_backend_2d_n50
 )
 
 add_library(gfold_solver ALIAS gfold_solver_router)

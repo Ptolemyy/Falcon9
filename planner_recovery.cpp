@@ -1,6 +1,12 @@
 #include "planner_recovery.hpp"
+#include "GFOLD_solver.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
+#include <utility>
+#include <vector>
 
 namespace falcon9 {
 
@@ -20,8 +26,47 @@ struct LandingPhaseResult {
     double touchdown_downrange_km = 0.0;
     double touchdown_speed_mps = 0.0;
     double prop_used_kg = 0.0;
+    double terminal_mass_kg = std::numeric_limits<double>::quiet_NaN();
     std::vector<SimPt> traj;
 };
+
+constexpr double kGfold2dVelocityLimitMps = 300.0;
+constexpr std::array<double, 10> kGfold2dTfCandidatesS = {8.0, 12.0, 16.0, 20.0, 25.0, 30.0, 40.0, 55.0, 70.0, 90.0};
+
+std::vector<double> select_landing_tf_candidates(const MissionRequest& request, const LocalState& s) {
+    const double stage_thrust_N = request.s1_thrust_kN * 1000.0;
+    const double thrust_max_N = stage_thrust_N / 3.0;
+    const double g = grav(std::max(0.0, s.z));
+    const double thrust_acc_max = thrust_max_N / std::max(1.0, s.m);
+    const double usable_decel = std::max(1.0, thrust_acc_max - g);
+    const double speed = std::hypot(s.vx, s.vz);
+    const double t_brake = speed / usable_decel;
+    const double t_fall = std::sqrt(2.0 * std::max(0.0, s.z) / std::max(1.0, g));
+    const double t_est = clampd(t_brake + 0.35 * t_fall, kGfold2dTfCandidatesS.front(), kGfold2dTfCandidatesS.back());
+
+    int center = 0;
+    double best_err = std::numeric_limits<double>::infinity();
+    for (int i = 0; i < static_cast<int>(kGfold2dTfCandidatesS.size()); ++i) {
+        const double err = std::abs(kGfold2dTfCandidatesS[static_cast<std::size_t>(i)] - t_est);
+        if (err < best_err) {
+            best_err = err;
+            center = i;
+        }
+    }
+
+    std::vector<double> out;
+    out.reserve(4);
+    auto add_idx = [&](int idx) {
+        if (idx < 0 || idx >= static_cast<int>(kGfold2dTfCandidatesS.size())) return;
+        const double tf = kGfold2dTfCandidatesS[static_cast<std::size_t>(idx)];
+        if (std::find(out.begin(), out.end(), tf) == out.end()) out.push_back(tf);
+    };
+    add_idx(center);
+    add_idx(center - 1);
+    add_idx(center + 1);
+    if (s.z < 500.0) add_idx(0);
+    return out;
+}
 
 LocalState local_from_stage1_sep(const MissionRequest& request, const Stage1Result& stage1) {
     LocalState out;
@@ -46,7 +91,7 @@ void push_traj(std::vector<SimPt>& traj, double t_global, const LocalState& s) {
 // initial mass with `dry + prop_budget`, which made the binary search probe
 // physically inconsistent (lighter rocket → falsely lower fuel need) and was
 // the dominant reason the recovery solver kept declaring scenarios infeasible.
-LandingPhaseResult simulate_landing_phase(
+[[maybe_unused]] LandingPhaseResult simulate_landing_phase_legacy(
     const MissionRequest& request,
     const LocalState& ignition_state,
     double ignition_time_s,
@@ -224,6 +269,128 @@ LandingPhaseResult simulate_landing_phase(
     return out;
 }
 
+LandingPhaseResult simulate_landing_phase(
+    const MissionRequest& request,
+    const LocalState& ignition_state,
+    double ignition_time_s,
+    double prop_budget_kg,
+    bool record_traj) {
+    LandingPhaseResult out;
+    LocalState s = ignition_state;
+    if (s.m <= request.s1_dry_kg + 1.0) {
+        s.m = request.s1_dry_kg + std::max(0.0, prop_budget_kg);
+    }
+
+    const double speed = std::hypot(s.vx, s.vz);
+    out.touchdown_time_s = ignition_time_s;
+    out.touchdown_downrange_km = s.x / 1000.0;
+    out.touchdown_speed_mps = speed;
+    out.terminal_mass_kg = s.m;
+
+    if (!std::isfinite(speed) || speed > kGfold2dVelocityLimitMps || s.z <= 0.0 ||
+        s.m <= request.s1_dry_kg + 1.0 || prop_budget_kg <= 0.0) {
+        return out;
+    }
+
+    const double stage_thrust_N = request.s1_thrust_kN * 1000.0;
+    const double thrust_max_N = stage_thrust_N / 3.0;
+    const double thrust_min_N = (stage_thrust_N / 9.0) * 0.15;
+    if (thrust_max_N <= 0.0 || thrust_min_N <= 0.0 || thrust_min_N > thrust_max_N) {
+        return out;
+    }
+
+    GFOLDSolution best_solution;
+    double best_terminal_mass = std::numeric_limits<double>::quiet_NaN();
+    double best_prop_used = std::numeric_limits<double>::infinity();
+    double best_speed = std::numeric_limits<double>::infinity();
+    double best_tf = std::numeric_limits<double>::quiet_NaN();
+    bool have_best = false;
+
+    for (const double tf : select_landing_tf_candidates(request, s)) {
+        GFOLDConfig cfg;
+        cfg.steps = 50;
+        cfg.solver_n = 50;
+        cfg.tf = tf;
+        cfg.elapsed_time = ignition_time_s;
+        cfg.g0 = grav(std::max(0.0, s.z));
+        cfg.Isp = request.s1_isp_s;
+        cfg.T_max = thrust_max_N;
+        cfg.throttle_min = thrust_min_N / thrust_max_N;
+        cfg.throttle_max = 1.0;
+        cfg.m0 = s.m;
+        cfg.r0[0] = std::max(0.0, s.z);
+        cfg.r0[1] = 0.0;
+        cfg.r0[2] = 0.0;
+        cfg.v0[0] = s.vz;
+        cfg.v0[1] = s.vx;
+        cfg.v0[2] = 0.0;
+        cfg.glide_slope_deg = 30.0;
+        cfg.max_angle_deg = 45.0;
+
+        GFOLDSolution sol;
+        GFOLDSolverInfo info;
+        double terminal_mass = std::numeric_limits<double>::quiet_NaN();
+        if (!solve_gfold_p4_n50_2d_free_x(cfg, sol, &info, nullptr, &terminal_mass)) {
+            continue;
+        }
+        if (!std::isfinite(terminal_mass) || terminal_mass < request.s1_dry_kg - 1e-3) {
+            continue;
+        }
+        if (sol.steps <= 0 || sol.vx.size() != static_cast<std::size_t>(sol.steps) ||
+            sol.vy.size() != static_cast<std::size_t>(sol.steps)) {
+            continue;
+        }
+
+        const std::size_t last = static_cast<std::size_t>(sol.steps - 1);
+        const double terminal_speed = std::hypot(sol.vx[last], sol.vy[last]);
+        const double prop_used = std::max(0.0, s.m - terminal_mass);
+        if (!std::isfinite(terminal_speed) || !std::isfinite(prop_used) ||
+            prop_used > prop_budget_kg + 1e-3 || terminal_speed > 12.0) {
+            continue;
+        }
+
+        const bool better =
+            !have_best ||
+            prop_used < best_prop_used - 1e-6 ||
+            (std::abs(prop_used - best_prop_used) <= 1e-6 &&
+             (terminal_speed < best_speed - 1e-6 ||
+              (std::abs(terminal_speed - best_speed) <= 1e-6 && tf < best_tf)));
+        if (better) {
+            have_best = true;
+            best_solution = std::move(sol);
+            best_terminal_mass = terminal_mass;
+            best_prop_used = prop_used;
+            best_speed = terminal_speed;
+            best_tf = tf;
+        }
+    }
+
+    if (!have_best) return out;
+
+    const std::size_t last = static_cast<std::size_t>(best_solution.steps - 1);
+    const double terminal_downrange_m = s.x + best_solution.ry[last];
+
+    out.success = true;
+    out.touchdown_time_s = ignition_time_s + best_tf;
+    out.touchdown_downrange_km = terminal_downrange_m / 1000.0;
+    out.touchdown_speed_mps = best_speed;
+    out.prop_used_kg = best_prop_used;
+    out.terminal_mass_kg = best_terminal_mass;
+
+    if (record_traj) {
+        out.traj.reserve(static_cast<std::size_t>(best_solution.steps));
+        for (int i = 0; i < best_solution.steps; ++i) {
+            const std::size_t idx = static_cast<std::size_t>(i);
+            out.traj.push_back({
+                best_solution.t[idx],
+                (s.x + best_solution.ry[idx]) / 1000.0,
+                std::max(0.0, best_solution.rx[idx] / 1000.0),
+            });
+        }
+    }
+    return out;
+}
+
 }  // namespace
 
 RecoveryResult simulate_stage1_recovery(
@@ -271,18 +438,22 @@ RecoveryResult simulate_stage1_recovery(
             if (check_accum_s >= 1.0) {
                 check_accum_s = 0.0;
                 const double ignition_time_s = stage1.sep_s + t_local;
-                const LandingPhaseResult full_budget_try =
-                    simulate_landing_phase(request, s, ignition_time_s, landing_prop_before, false);
-                // Because simulate_landing_phase no longer scales the booster
-                // mass with the propellant budget, the propellant *actually
-                // consumed* during a full-budget run is already the minimum
-                // amount needed for that ignition state.  This avoids the
-                // expensive 10-iteration binary search the original code did
-                // (which inflated solver runtime by an order of magnitude
-                // without producing a more accurate answer in practice).
+                const double rough_required_prop = estimate_prop_need_from_state(s);
+                LandingPhaseResult full_budget_try;
+                if (rough_required_prop > landing_prop_before + 500.0) {
+                    full_budget_try.touchdown_time_s = ignition_time_s;
+                    full_budget_try.touchdown_downrange_km = s.x / 1000.0;
+                    full_budget_try.touchdown_speed_mps = std::hypot(s.vx, s.vz);
+                    full_budget_try.prop_used_kg = 0.0;
+                } else {
+                    full_budget_try = simulate_landing_phase(request, s, ignition_time_s, landing_prop_before, false);
+                }
+                // The GFOLD landing solve reports the terminal mass directly,
+                // so a successful run's consumed propellant is the landing
+                // fuel cost for this ignition state.
                 double required_prop = full_budget_try.success
                     ? std::max(0.0, full_budget_try.prop_used_kg)
-                    : landing_prop_before;
+                    : std::max(landing_prop_before, rough_required_prop);
                 if (!full_budget_try.success) {
                     const double residual_prop_need =
                         prop_for_dv(
@@ -290,7 +461,7 @@ RecoveryResult simulate_stage1_recovery(
                                      request.s1_dry_kg + 1.0),
                             2.0 * std::max(0.0, full_budget_try.touchdown_speed_mps - 10.0) + 80.0,
                             request.s1_isp_s);
-                    required_prop = landing_prop_before + residual_prop_need;
+                    required_prop = std::max(required_prop, landing_prop_before + residual_prop_need);
                 }
 
                 const bool better =
@@ -375,6 +546,33 @@ RecoveryResult simulate_stage1_recovery(
         return out;
     }
 
+    if (!found_feasible_ignition) {
+        out.touchdown_time_s = best_phase.touchdown_time_s > 0.0
+            ? best_phase.touchdown_time_s
+            : stage1.sep_s + t_local;
+        out.touchdown_downrange_km = std::isfinite(best_phase.touchdown_downrange_km)
+            ? best_phase.touchdown_downrange_km
+            : best_ign_state.x / 1000.0;
+        out.touchdown_speed_mps = std::isfinite(best_phase.touchdown_speed_mps)
+            ? best_phase.touchdown_speed_mps
+            : std::hypot(best_ign_state.vx, best_ign_state.vz);
+        destination_from_course(
+            request.lat_deg,
+            request.launch_lon_deg,
+            launch_az_deg,
+            out.touchdown_downrange_km,
+            out.touchdown_lat_deg,
+            out.touchdown_lon_deg);
+        out.landing_prop_kg = std::max(landing_prop_before + 1.0, estimate_prop_need_from_state(best_ign_state));
+        if (std::isfinite(best_required_prop)) {
+            out.landing_prop_kg = std::max(out.landing_prop_kg, best_required_prop);
+        }
+        out.margin_kg = landing_prop_before - out.landing_prop_kg;
+        out.feasible = false;
+        out.converged = false;
+        return out;
+    }
+
     out.landing_ignition_time_s = best_ign_time_s;
     const LandingPhaseResult actual =
         simulate_landing_phase(request, best_ign_state, out.landing_ignition_time_s, landing_prop_before, true);
@@ -390,15 +588,11 @@ RecoveryResult simulate_stage1_recovery(
         out.touchdown_lat_deg,
         out.touchdown_lon_deg);
 
-    // Trust the high-resolution landing simulation as the ground-truth answer:
-    // its `prop_used_kg` is the real fuel cost.  If it ran out of budget the
-    // simulation will have terminated with the booster still aloft and the
-    // residual prop_need is added on top.  This avoids the previous behaviour
-    // where the coarse 1-Hz ignition-time grid produced a `best_required_prop`
-    // that didn't match the recorded high-resolution result and made the
-    // feasibility flag oscillate.
     double final_prop_kg = std::max(0.0, actual.prop_used_kg);
-    if (!actual.success) {
+    if (actual.success && std::isfinite(actual.terminal_mass_kg)) {
+        out.landing_prop_kg = final_prop_kg;
+        out.margin_kg = actual.terminal_mass_kg - request.s1_dry_kg;
+    } else {
         const double residual_prop_need =
             prop_for_dv(
                 std::max(request.s1_dry_kg + std::max(0.0, landing_prop_before - actual.prop_used_kg),
@@ -406,10 +600,11 @@ RecoveryResult simulate_stage1_recovery(
                 2.0 * std::max(0.0, actual.touchdown_speed_mps - 10.0) + 60.0,
                 request.s1_isp_s);
         final_prop_kg = landing_prop_before + residual_prop_need;
+        out.landing_prop_kg = final_prop_kg;
+        out.margin_kg = landing_prop_before - out.landing_prop_kg;
     }
-    out.landing_prop_kg = final_prop_kg;
-    out.margin_kg = landing_prop_before - out.landing_prop_kg;
     out.converged =
+        actual.success &&
         std::isfinite(out.touchdown_time_s) &&
         std::isfinite(out.touchdown_downrange_km) &&
         std::isfinite(out.touchdown_speed_mps) &&

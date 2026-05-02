@@ -96,3 +96,10 @@ private:
     GFOLDSolverLimits last_limits_;
     double last_terminal_mass_ = std::numeric_limits<double>::quiet_NaN();
 };
+
+bool solve_gfold_p4_n50_2d_free_x(
+    const GFOLDConfig& cfg,
+    GFOLDSolution& solution,
+    GFOLDSolverInfo* info = nullptr,
+    GFOLDSolverLimits* limits = nullptr,
+    double* terminal_mass = nullptr);

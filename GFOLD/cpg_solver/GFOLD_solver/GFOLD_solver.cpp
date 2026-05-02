@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
 
 extern "C" bool gfold_backend_solve_n3(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
 extern "C" bool gfold_backend_solve_n10(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
 extern "C" bool gfold_backend_solve_n25(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
 extern "C" bool gfold_backend_solve_n50(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
 extern "C" bool gfold_backend_solve_n100(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
+extern "C" bool gfold_backend_solve_2d_n50(const GFOLDBackendConfig* cfg, GFOLDBackendOutput* out);
 
 namespace {
 
@@ -159,6 +161,79 @@ GFOLDSolution GFOLDSolver::solution() const {
 
 double GFOLDSolver::terminal_mass() const {
     return last_terminal_mass_;
+}
+
+bool solve_gfold_p4_n50_2d_free_x(
+    const GFOLDConfig& cfg,
+    GFOLDSolution& solution,
+    GFOLDSolverInfo* info,
+    GFOLDSolverLimits* limits,
+    double* terminal_mass) {
+    if (cfg.steps != 50) {
+        solution = GFOLDSolution{};
+        if (info) {
+            *info = GFOLDSolverInfo{};
+            info->status = -902;
+        }
+        if (limits) *limits = GFOLDSolverLimits{};
+        if (terminal_mass) *terminal_mass = std::numeric_limits<double>::quiet_NaN();
+        return false;
+    }
+
+    const std::size_t cap = static_cast<std::size_t>(cfg.steps);
+    solution = GFOLDSolution{};
+    solution.steps = cfg.steps;
+    solution.t.assign(cap, 0.0);
+    solution.ux.assign(cap, 0.0);
+    solution.uy.assign(cap, 0.0);
+    solution.uz.assign(cap, 0.0);
+    solution.vx.assign(cap, 0.0);
+    solution.vy.assign(cap, 0.0);
+    solution.vz.assign(cap, 0.0);
+    solution.rx.assign(cap, 0.0);
+    solution.ry.assign(cap, 0.0);
+    solution.rz.assign(cap, 0.0);
+    solution.z.assign(cap, 0.0);
+
+    GFOLDBackendConfig backend_cfg = to_backend_cfg(cfg);
+    GFOLDBackendOutput backend_out;
+    backend_out.capacity = cap;
+    backend_out.t = solution.t.data();
+    backend_out.ux = solution.ux.data();
+    backend_out.uy = solution.uy.data();
+    backend_out.uz = solution.uz.data();
+    backend_out.vx = solution.vx.data();
+    backend_out.vy = solution.vy.data();
+    backend_out.vz = solution.vz.data();
+    backend_out.rx = solution.rx.data();
+    backend_out.ry = solution.ry.data();
+    backend_out.rz = solution.rz.data();
+    backend_out.z = solution.z.data();
+
+    static std::mutex backend_mutex;
+    std::lock_guard<std::mutex> lock(backend_mutex);
+    const bool ok = gfold_backend_solve_2d_n50(&backend_cfg, &backend_out);
+
+    if (info) {
+        info->status = backend_out.info.status;
+        info->iter = backend_out.info.iter;
+        info->obj_val = backend_out.info.obj_val;
+        info->pri_res = backend_out.info.pri_res;
+        info->dua_res = backend_out.info.dua_res;
+        if (!ok && info->status == -999) info->status = -903;
+    }
+    if (limits) {
+        limits->feastol = backend_out.limits.feastol;
+        limits->abstol = backend_out.limits.abstol;
+        limits->reltol = backend_out.limits.reltol;
+        limits->feastol_inacc = backend_out.limits.feastol_inacc;
+        limits->abstol_inacc = backend_out.limits.abstol_inacc;
+        limits->reltol_inacc = backend_out.limits.reltol_inacc;
+        limits->maxit = backend_out.limits.maxit;
+    }
+    if (terminal_mass) *terminal_mass = backend_out.terminal_mass;
+
+    return ok;
 }
 
 GFOLDThrustProfile GFOLDSolver::compute_thrust_profile() const {
