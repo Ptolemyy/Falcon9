@@ -4,7 +4,9 @@
 #include "planner_recovery.hpp"
 #include "planner_upfg.hpp"
 
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -13,6 +15,110 @@
 namespace falcon9 {
 
 namespace {
+
+using ProfileClock = std::chrono::steady_clock;
+
+struct ProfileCounter {
+    std::atomic<long long> ns{0};
+    std::atomic<int> count{0};
+
+    void reset() {
+        ns.store(0, std::memory_order_relaxed);
+        count.store(0, std::memory_order_relaxed);
+    }
+
+    void add(ProfileClock::duration dt) {
+        ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count(), std::memory_order_relaxed);
+        count.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+struct MissionProfile {
+    bool enabled = false;
+    ProfileCounter solve_total;
+    ProfileCounter lvd_total;
+    ProfileCounter lvd_mission_search;
+    ProfileCounter final_sep_search;
+    ProfileCounter sep_candidate_total;
+    ProfileCounter clip_stage1;
+    ProfileCounter stage2;
+    ProfileCounter recovery;
+    ProfileCounter report_build;
+
+    void reset(bool on) {
+        enabled = on;
+        solve_total.reset();
+        lvd_total.reset();
+        lvd_mission_search.reset();
+        final_sep_search.reset();
+        sep_candidate_total.reset();
+        clip_stage1.reset();
+        stage2.reset();
+        recovery.reset();
+        report_build.reset();
+    }
+};
+
+MissionProfile& mission_profile() {
+    static MissionProfile profile;
+    return profile;
+}
+
+bool mission_profile_requested() {
+    char value[8]{};
+    const DWORD n = GetEnvironmentVariableA("F9_PROFILE", value, static_cast<DWORD>(sizeof(value)));
+    return n > 0 && value[0] != '0';
+}
+
+struct ScopedProfile {
+    ProfileCounter* counter = nullptr;
+    ProfileClock::time_point start{};
+
+    explicit ScopedProfile(ProfileCounter& c, bool enabled) {
+        if (enabled) {
+            counter = &c;
+            start = ProfileClock::now();
+        }
+    }
+
+    ~ScopedProfile() {
+        if (counter) counter->add(ProfileClock::now() - start);
+    }
+};
+
+double profile_ms(const ProfileCounter& counter) {
+    return static_cast<double>(counter.ns.load(std::memory_order_relaxed)) / 1.0e6;
+}
+
+int profile_count(const ProfileCounter& counter) {
+    return counter.count.load(std::memory_order_relaxed);
+}
+
+void print_mission_profile(const MissionProfile& profile) {
+    if (!profile.enabled) return;
+    const double total_ms = std::max(1e-9, profile_ms(profile.solve_total));
+    auto line = [&](const char* name, const ProfileCounter& c) {
+        const double ms = profile_ms(c);
+        std::fprintf(
+            stderr,
+            "[F9_PROFILE] %-24s wall_or_sum=%9.2f ms  pct_of_solve=%6.2f  count=%d\n",
+            name,
+            ms,
+            100.0 * ms / total_ms,
+            profile_count(c));
+    };
+    std::fprintf(stderr, "[F9_PROFILE] ---- solve_mission timing ----\n");
+    line("solve_total", profile.solve_total);
+    line("stage1_lvd_total", profile.lvd_total);
+    line("lvd_nested_sep_search", profile.lvd_mission_search);
+    line("final_sep_search", profile.final_sep_search);
+    line("sep_candidate_sum", profile.sep_candidate_total);
+    line("clip_stage1_sum", profile.clip_stage1);
+    line("stage2_upfg_sum", profile.stage2);
+    line("recovery_sum", profile.recovery);
+    line("report_build", profile.report_build);
+    std::fprintf(stderr, "[F9_PROFILE] -------------------------------\n");
+}
 
 struct Stage1Target {
     double sep_time_s = 0.0;
@@ -393,10 +499,369 @@ Stage1Result simulate_stage1_candidate(
     return out;
 }
 
+double downrange_from_state3d(const StateVector3D& s, const OrbitTarget& orbit_target) {
+    const Vec3 rhat = normalize3(s.r_m);
+    return kRe * std::atan2(
+        dot3(rhat, orbit_target.launch_tangent_eci),
+        dot3(rhat, orbit_target.launch_rhat_eci));
+}
+
+Vec3 plane_radial_at(const StateVector3D& s, const OrbitTarget& orbit_target) {
+    const Vec3 n_hat = normalize3(orbit_target.plane_normal_eci);
+    Vec3 rhat = normalize3(reject3(s.r_m, n_hat));
+    if (dot3(rhat, rhat) < 1e-10) rhat = normalize3(s.r_m);
+    return rhat;
+}
+
+Vec3 plane_tangent_at(const StateVector3D& s, const OrbitTarget& orbit_target) {
+    const Vec3 rhat = plane_radial_at(s, orbit_target);
+    Vec3 that = normalize3(cross3(normalize3(orbit_target.plane_normal_eci), rhat));
+    if (dot3(that, s.v_mps) < 0.0) that *= -1.0;
+    return that;
+}
+
+Vec3 clamp_thrust_dir_gamma(const Vec3& dir, const Vec3& rhat, double gamma_lo_rad, double gamma_hi_rad) {
+    const double radial = dot3(dir, rhat);
+    Vec3 horizontal = dir - rhat * radial;
+    const double horizontal_norm = norm3(horizontal);
+    if (horizontal_norm <= 1e-9) {
+        horizontal = reject3({1.0, 0.0, 0.0}, rhat);
+        if (norm3(horizontal) <= 1e-9) horizontal = reject3({0.0, 1.0, 0.0}, rhat);
+        horizontal = normalize3(horizontal);
+    } else {
+        horizontal = horizontal / horizontal_norm;
+    }
+
+    const double gamma = std::atan2(radial, std::max(1e-9, horizontal_norm));
+    const double clamped = clampd(gamma, gamma_lo_rad, gamma_hi_rad);
+    return normalize3(horizontal * std::cos(clamped) + rhat * std::sin(clamped));
+}
+
+Vec3 limit_direction_change(const Vec3& from, const Vec3& to, double max_angle_rad) {
+    const Vec3 a = normalize3(from);
+    const Vec3 b = normalize3(to);
+    const double c = clampd(dot3(a, b), -1.0, 1.0);
+    const double angle = std::acos(c);
+    if (angle <= std::max(1e-9, max_angle_rad)) return b;
+
+    Vec3 lateral = b - a * c;
+    const double lateral_norm = norm3(lateral);
+    if (lateral_norm <= 1e-9) return b;
+    lateral = lateral / lateral_norm;
+    return normalize3(a * std::cos(max_angle_rad) + lateral * std::sin(max_angle_rad));
+}
+
+PolarState polar_from_state3d(const StateVector3D& s, const OrbitTarget& orbit_target) {
+    const Vec3 rhat = normalize3(s.r_m);
+    const Vec3 that = plane_tangent_at(s, orbit_target);
+    return {
+        norm3(s.r_m),
+        downrange_from_state3d(s, orbit_target) / kRe,
+        dot3(s.v_mps, rhat),
+        dot3(s.v_mps, that),
+        s.m_kg,
+    };
+}
+
+Stage2Result simulate_stage2_candidate_3d(
+    const MissionRequest& request,
+    const Stage1Result& stage1,
+    const OrbitTarget& orbit_target) {
+    Stage2Result out;
+    if (!stage1.sep3d.valid || !orbit_target.has_3d_plane) return out;
+
+    StateVector3D ignition_seed = stage1.sep3d;
+    ignition_seed.m_kg = request.s2_dry_kg + request.s2_prop_kg + request.payload_kg;
+    ignition_seed.valid = true;
+
+    const double ignition_delay = clampd(request.s2_ignition_delay_s, 3.0, 15.0);
+    const double target_r = kRe + orbit_target.cutoff_alt_km * 1000.0;
+    const double target_a = kRe + 0.5 * (orbit_target.rp_km + orbit_target.ra_km) * 1000.0;
+    const double target_ra = kRe + orbit_target.ra_km * 1000.0;
+    const double target_e = (target_ra - (kRe + orbit_target.rp_km * 1000.0)) / std::max(1.0, target_ra + (kRe + orbit_target.rp_km * 1000.0));
+    const double target_p = target_a * (1.0 - target_e * target_e);
+    const double target_h = std::sqrt(kMu * target_p);
+    const double thrust = request.s2_thrust_kN * 1000.0;
+    const double mdot_nom = thrust / std::max(1e-6, request.s2_isp_s * kG0);
+    const double burn_max = request.s2_prop_kg / std::max(1e-6, mdot_nom);
+
+    const UpfgVehicle upfg_vehicle{thrust, request.s2_isp_s, 1.0, 1.0};
+    const UpfgTarget3D upfg_target{
+        orbit_target.r_target_m,
+        orbit_target.vr_target_mps,
+        orbit_target.vt_target_mps,
+        orbit_target.plane_normal_eci,
+    };
+    const UpfgSettings upfg_settings{
+        6.0,
+        -10.0,
+        55.0,
+        1.18,
+        1.28,
+        1.12,
+        10.0,
+        14.0,
+    };
+
+    auto push_traj = [&](Stage2Result& cand, double t_global, const StateVector3D& s) {
+        const double downrange_km = downrange_from_state3d(s, orbit_target) / 1000.0;
+        const double alt_km = std::max(0.0, (norm3(s.r_m) - kRe) / 1000.0);
+        cand.traj.push_back({t_global, downrange_km, alt_km});
+        cand.traj3d.push_back({t_global, s.r_m, s.v_mps});
+    };
+
+    auto simulate_candidate = [&](double gamma_bias_deg, double climb_start_u, double climb_end_u, double vr_gain, double vt_gain, double end_gamma_deg, double rate_limit_deg_s) {
+        Stage2Result cand;
+        cand.traj.reserve(960);
+        cand.traj3d.reserve(960);
+
+        StateVector3D s = ignition_seed;
+        push_traj(cand, stage1.sep_s, s);
+        double t_global = stage1.sep_s;
+        double t_local = 0.0;
+        while (t_local < ignition_delay - 1e-9) {
+            const double dt = std::min(0.5, ignition_delay - t_local);
+            propagate_state3d_coast(s, dt);
+            t_local += dt;
+            t_global += dt;
+            if (t_global - cand.traj.back().t >= 1.0 || t_local >= ignition_delay - 1e-6) {
+                push_traj(cand, t_global, s);
+            }
+        }
+
+        cand.ignition3d = s;
+        cand.ignition = polar_from_state3d(s, orbit_target);
+        cand.ignition_s = t_global;
+
+        const Vec3 rhat_initial = normalize3(s.r_m);
+        const Vec3 that_initial = plane_tangent_at(s, orbit_target);
+        const double gamma_initial = clampd(
+            std::atan2(dot3(s.v_mps, rhat_initial), std::max(1.0, dot3(s.v_mps, that_initial))),
+            deg2rad(-2.0),
+            deg2rad(45.0));
+        Vec3 thrust_dir_cmd = normalize3(that_initial * std::cos(gamma_initial) + rhat_initial * std::sin(gamma_initial));
+
+        double used = 0.0;
+        double burn_elapsed = 0.0;
+        StateVector3D best_state = s;
+        OrbitMetrics best_orbit{};
+        double best_cutoff_s = cand.ignition_s;
+        double best_used = 0.0;
+        double best_rp_err_km = 0.0;
+        double best_ra_err_km = 0.0;
+        double best_target_r_err_km = 0.0;
+        double best_fpa_err_deg = 0.0;
+        double best_peak_alt_km = std::max(0.0, (norm3(s.r_m) - kRe) / 1000.0);
+        double best_penalty = std::numeric_limits<double>::infinity();
+        double best_selection_score = std::numeric_limits<double>::infinity();
+        bool best_orbit_ok = false;
+        bool best_converged = false;
+        double best_tgo = burn_max;
+        double best_vgo = std::numeric_limits<double>::infinity();
+        size_t best_traj_size = cand.traj.size();
+        double peak_alt_km = std::max(0.0, (norm3(s.r_m) - kRe) / 1000.0);
+        bool crashed = false;
+
+        while (burn_elapsed < burn_max - 1e-9 && used < request.s2_prop_kg - 1e-9) {
+            const double r_now = norm3(s.r_m);
+            const double target_r_distance = std::abs(target_r - r_now);
+            const double prop_tgo_full = std::max(0.0, (request.s2_prop_kg - used) / std::max(1e-6, mdot_nom));
+            double guide_dt = 0.50;
+            if (burn_elapsed >= 0.70 * burn_max || target_r_distance <= 120000.0) guide_dt = 0.25;
+            if (burn_elapsed >= 0.90 * burn_max || target_r_distance <= 60000.0 || prop_tgo_full <= 35.0) guide_dt = 0.10;
+            const double dt = std::min(guide_dt, std::max(0.0, prop_tgo_full));
+            if (dt <= 1e-9) break;
+
+            const Vec3 rhat = normalize3(s.r_m);
+            const UpfgCommand cmd = upfg_compute_command_3d(s, upfg_vehicle, upfg_target, upfg_settings, prop_tgo_full, dt);
+            const double vt_target = target_h / std::max(1.0, r_now);
+            const double r_safe = std::max(1.0, r_now);
+            const Vec3 gravity = s.r_m * (-kMu / (r_safe * r_safe * r_safe));
+            const double alt_to_go = std::max(0.0, target_r - r_now);
+            Vec3 thrust_dir_desired = normalize3(cmd.thrust_dir_eci);
+            const double rate_limit_deg =
+                (alt_to_go > 60000.0) ? 6.0 :
+                (alt_to_go > 25000.0) ? 4.5 :
+                5.0;
+            thrust_dir_cmd = limit_direction_change(thrust_dir_cmd, thrust_dir_desired, deg2rad(rate_limit_deg) * dt);
+            Vec3 thrust_dir = thrust_dir_cmd;
+
+            const double throttle_cmd = clampd(cmd.throttle, 0.0, 1.0);
+            const double dm = std::min(mdot_nom * throttle_cmd * dt, request.s2_prop_kg - used);
+            const double mdot = dm / std::max(1e-9, dt);
+            const double thrust_now = mdot * request.s2_isp_s * kG0;
+            const Vec3 accel = thrust_dir * (thrust_now / std::max(1.0, s.m_kg)) + gravity;
+            s.v_mps += accel * dt;
+            s.r_m += s.v_mps * dt;
+            s.m_kg -= dm;
+            used += dm;
+            burn_elapsed += dt;
+            t_global += dt;
+            if (norm3(s.r_m) < kRe) {
+                crashed = true;
+                break;
+            }
+            if (t_global - cand.traj.back().t >= 1.0 || burn_elapsed >= burn_max - 1e-6) {
+                push_traj(cand, t_global, s);
+            }
+            peak_alt_km = std::max(peak_alt_km, std::max(0.0, (norm3(s.r_m) - kRe) / 1000.0));
+
+            if (burn_elapsed >= 90.0 && (std::abs(norm3(s.r_m) - target_r) <= 90000.0 || burn_elapsed >= 0.65 * burn_max || cmd.tgo_s <= 85.0)) {
+                const OrbitMetrics orbit = orbit_metrics_from_state3d(s);
+                double rp_err_km = 0.0;
+                double ra_err_km = 0.0;
+                double target_r_err_km = 0.0;
+                double fpa_err_deg = 0.0;
+                bool orbit_ok = false;
+                const PolarState probe_polar = polar_from_state3d(s, orbit_target);
+                const Stage2Result probe_state{
+                    {},
+                    probe_polar,
+                    {},
+                    s,
+                    orbit,
+                    cand.ignition_s,
+                    burn_elapsed,
+                    t_global,
+                    used,
+                    std::max(0.0, request.s2_prop_kg - used),
+                };
+                const double penalty = stage2_orbit_penalty(orbit_target, probe_state, rp_err_km, ra_err_km, target_r_err_km, fpa_err_deg, orbit_ok);
+                double selection_score = penalty;
+                if (!orbit_ok) {
+                    const double rem_prop = std::max(0.0, request.s2_prop_kg - used);
+                    const double speed_shortfall = std::max(0.0, orbit_target.speed_target_mps - orbit.speed_mps);
+                    const double vt_shortfall = std::max(0.0, vt_target - dot3(s.v_mps, plane_tangent_at(s, orbit_target)));
+                    selection_score += std::max(0.0, speed_shortfall - 80.0) * 0.20;
+                    selection_score += std::max(0.0, vt_shortfall - 80.0) * 0.14;
+                    if (speed_shortfall > 250.0 || vt_shortfall > 250.0 || orbit.rp_km < orbit_target.rp_km - 40.0) {
+                        const double rp_deficit_km = std::max(0.0, orbit_target.rp_km - orbit.rp_km);
+                        selection_score += rem_prop * clampd(0.035 + 0.0006 * rp_deficit_km, 0.035, 0.38);
+                    }
+                }
+                const bool better =
+                    selection_score < best_selection_score - 1e-9 ||
+                    (std::abs(selection_score - best_selection_score) <= 1e-9 &&
+                        ((orbit_ok && used < best_used - 1e-6) || (!orbit_ok && used > best_used + 1e-6)));
+                if (better) {
+                    best_penalty = penalty;
+                    best_selection_score = selection_score;
+                    best_state = s;
+                    best_orbit = orbit;
+                    best_cutoff_s = t_global;
+                    best_used = used;
+                    best_rp_err_km = rp_err_km;
+                    best_ra_err_km = ra_err_km;
+                    best_target_r_err_km = target_r_err_km;
+                    best_fpa_err_deg = fpa_err_deg;
+                    best_peak_alt_km = peak_alt_km;
+                    best_orbit_ok = orbit_ok;
+                    best_converged = cmd.converged || orbit_ok;
+                    best_tgo = cmd.tgo_s;
+                    best_vgo = cmd.vgo_mps;
+                    best_traj_size = cand.traj.size();
+                }
+                if (stage2_precision_good(rp_err_km, ra_err_km, target_r_err_km, fpa_err_deg)) break;
+            }
+        }
+
+        if (best_penalty == std::numeric_limits<double>::infinity()) {
+            best_state = s;
+            best_cutoff_s = t_global;
+            best_used = used;
+            best_orbit = orbit_metrics_from_state3d(s);
+            best_peak_alt_km = peak_alt_km;
+            best_penalty = crashed ? std::numeric_limits<double>::infinity() : stage2_orbit_penalty(
+                orbit_target,
+                Stage2Result{{}, polar_from_state3d(s, orbit_target), {}, s, best_orbit, cand.ignition_s, burn_elapsed, best_cutoff_s, best_used, std::max(0.0, request.s2_prop_kg - best_used)},
+                best_rp_err_km,
+                best_ra_err_km,
+                best_target_r_err_km,
+                best_fpa_err_deg,
+                best_orbit_ok);
+            best_converged = false;
+            best_tgo = std::max(0.0, (request.s2_prop_kg - best_used) / std::max(1e-6, mdot_nom));
+            Vec3 target_v = normalize3(best_state.r_m) * upfg_target.target_vr_mps + plane_tangent_at(best_state, orbit_target) * upfg_target.target_vt_mps;
+            best_vgo = norm3(best_state.v_mps - target_v);
+            best_traj_size = cand.traj.size();
+        }
+
+        cand.seco3d = best_state;
+        cand.seco3d.valid = true;
+        cand.seco = polar_from_state3d(best_state, orbit_target);
+        cand.cutoff_s = best_cutoff_s;
+        cand.burn_s = cand.cutoff_s - cand.ignition_s;
+        cand.used_prop = best_used;
+        cand.rem_prop = std::max(0.0, request.s2_prop_kg - best_used);
+        cand.orbit = best_orbit;
+        cand.target_rp_err_km = best_rp_err_km;
+        cand.target_ra_err_km = best_ra_err_km;
+        cand.target_r_err_km = best_target_r_err_km;
+        cand.target_fpa_err_deg = best_fpa_err_deg;
+        cand.peak_alt_km = best_peak_alt_km;
+        cand.orbit_penalty = crashed ? std::numeric_limits<double>::infinity() : best_penalty;
+        cand.orbit_ok = (!crashed) && best_orbit_ok;
+        cand.converged = (!crashed) && best_converged;
+        cand.tgo_final_s = best_tgo;
+        cand.vgo_final_mps = best_vgo;
+        while (cand.traj.size() > best_traj_size) cand.traj.pop_back();
+        while (cand.traj3d.size() > best_traj_size) cand.traj3d.pop_back();
+        if (!cand.traj.empty() && std::abs(cand.traj.back().t - cand.cutoff_s) > 1e-6) {
+            push_traj(cand, cand.cutoff_s, cand.seco3d);
+        }
+        return cand;
+    };
+
+    struct Candidate {
+        double gamma_bias_deg;
+        double climb_start_u;
+        double climb_end_u;
+        double vr_gain;
+        double vt_gain;
+        double end_gamma_deg;
+        double rate_limit_deg_s;
+    };
+
+    const Candidate candidates[] = {
+        {0.0, 0.18, 0.92, 1.30, 1.45, -0.2, 0.90},
+        {-6.0, 0.34, 1.00, 0.85, 2.35, -3.2, 1.80},
+        {-4.8, 0.30, 0.99, 0.95, 2.10, -2.3, 1.55},
+        {-3.5, 0.26, 0.98, 1.05, 1.75, -0.9, 1.25},
+        {-2.5, 0.24, 0.96, 1.10, 1.65, -0.6, 1.20},
+        {-1.5, 0.20, 0.94, 1.15, 1.60, -0.5, 1.10},
+        {-0.5, 0.18, 0.93, 1.25, 1.55, -0.3, 1.00},
+        {1.0, 0.14, 0.90, 1.45, 1.30, 0.0, 0.90},
+        {2.0, 0.12, 0.88, 1.60, 1.20, 0.2, 0.85},
+        {3.0, 0.10, 0.88, 1.90, 1.00, 0.6, 0.80},
+        {4.2, 0.08, 0.86, 2.10, 0.90, 1.0, 0.75},
+        {5.0, 0.10, 0.96, 2.30, 0.95, 1.8, 0.80},
+        {6.5, 0.14, 1.00, 2.50, 0.90, 2.4, 0.85},
+    };
+
+    Stage2Result best;
+    best.orbit_penalty = std::numeric_limits<double>::infinity();
+    bool have_best = false;
+    for (const Candidate& c : candidates) {
+        Stage2Result cand = simulate_candidate(c.gamma_bias_deg, c.climb_start_u, c.climb_end_u, c.vr_gain, c.vt_gain, c.end_gamma_deg, c.rate_limit_deg_s);
+        if (!have_best ||
+            cand.orbit_penalty < best.orbit_penalty - 1e-9 ||
+            (std::abs(cand.orbit_penalty - best.orbit_penalty) <= 1e-9 && cand.rem_prop > best.rem_prop + 1e-6)) {
+            best = std::move(cand);
+            have_best = true;
+        }
+        if (best.orbit_ok && stage2_precision_good(best.target_rp_err_km, best.target_ra_err_km, best.target_r_err_km, best.target_fpa_err_deg)) break;
+    }
+    return best;
+}
+
 Stage2Result simulate_stage2_candidate(
     const MissionRequest& request,
     const Stage1Result& stage1,
     const OrbitTarget& orbit_target) {
+    if (stage1.sep3d.valid && orbit_target.has_3d_plane) {
+        Stage2Result out3d = simulate_stage2_candidate_3d(request, stage1, orbit_target);
+        if (out3d.converged || std::isfinite(out3d.orbit_penalty)) return out3d;
+    }
     Stage2Result out;
     const PolarState ignition_seed{
         stage1.sep.r,
@@ -600,6 +1065,8 @@ Stage2Result simulate_stage2_candidate(
                 const Stage2Result probe_state{
                     {},
                     s,
+                    {},
+                    {},
                     orbit,
                     cand.ignition_s,
                     burn_elapsed,
@@ -667,7 +1134,7 @@ Stage2Result simulate_stage2_candidate(
             best_used = used;
             best_orbit = orbit_metrics_from_state(s);
             best_peak_alt_km = peak_alt_km;
-            best_penalty = stage2_orbit_penalty(cand.ignition_s > 0.0 ? orbit_target : orbit_target, Stage2Result{{}, best_state, best_orbit, cand.ignition_s, burn_elapsed, best_cutoff_s, best_used, std::max(0.0, request.s2_prop_kg - best_used)}, best_rp_err_km, best_ra_err_km, best_target_r_err_km, best_fpa_err_deg, best_orbit_ok);
+            best_penalty = stage2_orbit_penalty(cand.ignition_s > 0.0 ? orbit_target : orbit_target, Stage2Result{{}, best_state, {}, {}, best_orbit, cand.ignition_s, burn_elapsed, best_cutoff_s, best_used, std::max(0.0, request.s2_prop_kg - best_used)}, best_rp_err_km, best_ra_err_km, best_target_r_err_km, best_fpa_err_deg, best_orbit_ok);
             best_converged = false;
             best_tgo = upfg_prev_tgo;
             best_vgo = std::hypot(best_state.vr - upfg_target.target_vr_mps, best_state.vt - upfg_target.target_vt_mps);
@@ -1107,6 +1574,12 @@ LvdStateSample interpolate_lvd_state_sample(const std::vector<LvdStateSample>& s
         out.state.vr = lerpd(a.state.vr, b.state.vr, u);
         out.state.vt = lerpd(a.state.vt, b.state.vt, u);
         out.state.m = lerpd(a.state.m, b.state.m, u);
+        out.state3d.valid = a.state3d.valid && b.state3d.valid;
+        if (out.state3d.valid) {
+            out.state3d.r_m = a.state3d.r_m + (b.state3d.r_m - a.state3d.r_m) * u;
+            out.state3d.v_mps = a.state3d.v_mps + (b.state3d.v_mps - a.state3d.v_mps) * u;
+            out.state3d.m_kg = lerpd(a.state3d.m_kg, b.state3d.m_kg, u);
+        }
         out.q_kpa = lerpd(a.q_kpa, b.q_kpa, u);
         out.throttle = lerpd(a.throttle, b.throttle, u);
         return out;
@@ -1116,6 +1589,7 @@ LvdStateSample interpolate_lvd_state_sample(const std::vector<LvdStateSample>& s
 
 Stage1Result clip_stage1_from_lvd(
     const MissionRequest& request,
+    const OrbitTarget& orbit_target,
     const LvdResult& lvd,
     double sep_time_s) {
     Stage1Result out;
@@ -1129,6 +1603,7 @@ Stage1Result clip_stage1_from_lvd(
     out.min_throttle = 1.0;
     out.t_min_throttle = 0.0;
     out.traj.reserve(lvd.state_samples.size() + 16);
+    out.traj3d.reserve(lvd.state_samples.size() + 16);
 
     for (const LvdStateSample& s : lvd.state_samples) {
         if (s.t_s > meco_time_s + 1e-9) break;
@@ -1136,6 +1611,7 @@ Stage1Result clip_stage1_from_lvd(
         const double z_km = std::max(0.0, (s.state.r - kRe) / 1000.0);
         if (out.traj.empty() || s.t_s - out.traj.back().t >= 1.0 || std::abs(s.t_s - meco_time_s) <= 1e-6) {
             out.traj.push_back({s.t_s, x_km, z_km});
+            if (s.state3d.valid) out.traj3d.push_back({s.t_s, s.state3d.r_m, s.state3d.v_mps});
         }
         if (s.q_kpa > out.max_q) {
             out.max_q = s.q_kpa;
@@ -1165,10 +1641,85 @@ Stage1Result clip_stage1_from_lvd(
         request.s1_dry_kg + request.s1_prop_kg +
         request.s2_dry_kg + request.s2_prop_kg + request.payload_kg;
     out.meco = meco_sample.state;
+    out.meco3d = meco_sample.state3d;
     out.meco_s = meco_time_s;
     out.burn_s = meco_time_s;
     out.used_prop = clampd(initial_mass - meco_sample.state.m, 0.0, request.s1_prop_kg);
     out.rem_prop = std::max(0.0, request.s1_prop_kg - out.used_prop);
+
+    if (meco_sample.state3d.valid) {
+        StateVector3D s = meco_sample.state3d;
+        s.m_kg = meco_sample.state.m;
+        const double cda = 9.0;
+        double t = meco_time_s;
+        double coast_elapsed = 0.0;
+        while (coast_elapsed < sep_delay_s - 1e-9) {
+            const double dt = std::min(0.20, sep_delay_s - coast_elapsed);
+            const double r_norm = std::max(1.0, norm3(s.r_m));
+            const double alt_m = std::max(0.0, r_norm - kRe);
+            const Vec3 air_v = s.v_mps - cross3({0.0, 0.0, kOmega}, s.r_m);
+            const double air_speed = norm3(air_v);
+            const double dens = rho(alt_m);
+            const double drag = 0.5 * dens * air_speed * air_speed * cda;
+            Vec3 drag_acc{0.0, 0.0, 0.0};
+            if (air_speed > 1e-6) {
+                drag_acc = air_v * ((drag / std::max(1.0, s.m_kg)) / air_speed);
+            }
+            const Vec3 gravity = s.r_m * (-kMu / (r_norm * r_norm * r_norm));
+            s.v_mps += (gravity - drag_acc) * dt;
+            s.r_m += s.v_mps * dt;
+            t += dt;
+            coast_elapsed += dt;
+            if (norm3(s.r_m) < kRe) {
+                const Vec3 rhat = normalize3(s.r_m);
+                s.r_m = rhat * kRe;
+                const double vr = dot3(s.v_mps, rhat);
+                if (vr < 0.0) s.v_mps -= rhat * vr;
+            }
+
+            const Vec3 rhat = normalize3(s.r_m);
+            const double downrange_km = kRe * std::atan2(
+                dot3(rhat, orbit_target.launch_tangent_eci),
+                dot3(rhat, orbit_target.launch_rhat_eci)) / 1000.0;
+            const double z_km = std::max(0.0, (norm3(s.r_m) - kRe) / 1000.0);
+            if (out.traj.empty() || t - out.traj.back().t >= 1.0 || coast_elapsed >= sep_delay_s - 1e-6) {
+                const double legacy_x_km = meco_sample.state.theta * (kRe / 1000.0) +
+                    (t - meco_time_s) * meco_sample.state.vt / 1000.0;
+                out.traj.push_back({t, std::isfinite(downrange_km) ? downrange_km : legacy_x_km, z_km});
+                out.traj3d.push_back({t, s.r_m, s.v_mps});
+            }
+        }
+        out.sep3d = s;
+        out.sep3d.valid = true;
+        const Vec3 rhat = normalize3(s.r_m);
+        const Vec3 n_hat = normalize3(orbit_target.plane_normal_eci);
+        Vec3 that = normalize3(cross3(n_hat, rhat));
+        if (dot3(that, s.v_mps) < 0.0) that *= -1.0;
+        out.sep = {norm3(s.r_m), out.traj.empty() ? meco_sample.state.theta : out.traj.back().x_km * 1000.0 / kRe, dot3(s.v_mps, rhat), dot3(s.v_mps, that), s.m_kg};
+        out.sep_s = t;
+        const double sep_alt_km = (out.sep.r - kRe) / 1000.0;
+        const double sep_speed_mps = norm3(s.v_mps);
+        const double sep_gamma_deg = rad2deg(std::atan2(out.sep.vr, std::max(1.0, std::sqrt(std::max(0.0, sep_speed_mps * sep_speed_mps - out.sep.vr * out.sep.vr)))));
+        out.target_alt_err_km = sep_alt_km - lvd.target_sep_alt_km;
+        out.target_speed_err_mps = sep_speed_mps - lvd.target_sep_speed_mps;
+        out.target_gamma_err_deg = sep_gamma_deg - lvd.target_sep_gamma_deg;
+        out.tgo_final_s = std::max(0.0, lvd.stage1.sep_s - out.sep_s);
+        out.vgo_final_mps = std::hypot(lvd.stage1.sep.vr - out.sep.vr, lvd.stage1.sep.vt - out.sep.vt);
+        out.converged =
+            std::isfinite(sep_alt_km) &&
+            std::isfinite(sep_speed_mps) &&
+            std::isfinite(sep_gamma_deg) &&
+            std::isfinite(out.max_q);
+        out.envelope_ok =
+            out.max_q <= request.q_limit_kpa + 1e-6 &&
+            sep_alt_km >= 35.0 &&
+            sep_alt_km <= 115.0 &&
+            sep_speed_mps >= 1500.0 &&
+            sep_speed_mps <= 3800.0 &&
+            sep_gamma_deg >= -6.0 &&
+            sep_gamma_deg <= 22.0;
+        return out;
+    }
 
     struct FlatState {
         double x = 0.0;
@@ -1264,13 +1815,18 @@ SepTimeEvaluation evaluate_lvd_sep_time_candidate(
     const LvdResult& lvd,
     double sep_time_s,
     SolveControl control) {
+    MissionProfile& profile = mission_profile();
+    ScopedProfile profile_scope(profile.sep_candidate_total, profile.enabled);
     SepTimeEvaluation best;
     const bool recovery_required = !control.ignore_recovery;
     if (cancellation_requested(control)) return best;
 
     SeparationCandidate cand;
     cand.sep_time_s = sep_time_s;
-    cand.stage1 = clip_stage1_from_lvd(request, lvd, sep_time_s);
+    {
+        ScopedProfile clip_scope(profile.clip_stage1, profile.enabled);
+        cand.stage1 = clip_stage1_from_lvd(request, orbit_target, lvd, sep_time_s);
+    }
     const double sep_alt_km = (cand.stage1.sep.r - kRe) / 1000.0;
     const double sep_speed_mps = std::hypot(cand.stage1.sep.vr, cand.stage1.sep.vt);
     const double sep_gamma_deg = rad2deg(std::atan2(cand.stage1.sep.vr, std::max(1.0, cand.stage1.sep.vt)));
@@ -1278,8 +1834,12 @@ SepTimeEvaluation evaluate_lvd_sep_time_candidate(
     cand.sep_speed_target_mps = sep_speed_mps;
     cand.sep_gamma_target_deg = sep_gamma_deg;
 
-    cand.stage2 = simulate_stage2_candidate(request, cand.stage1, orbit_target);
+    {
+        ScopedProfile stage2_scope(profile.stage2, profile.enabled);
+        cand.stage2 = simulate_stage2_candidate(request, cand.stage1, orbit_target);
+    }
     if (recovery_required) {
+        ScopedProfile recovery_scope(profile.recovery, profile.enabled);
         cand.recovery = simulate_stage1_recovery(request, cand.stage1, orbit_target.launch_az_deg);
     } else {
         cand.recovery.feasible = true;
@@ -1378,9 +1938,9 @@ std::vector<double> build_lvd_score_sep_times(const MissionRequest& request, con
     const double sep_lo = std::min(
         sep_hi,
         std::max(sep_delay_s + 60.0, sep_delay_s + 0.55 * std::max(1.0, lvd.stage1.meco_s)));
-    sep_times.reserve(9);
-    for (int i = 0; i <= 8; ++i) {
-        const double u = static_cast<double>(i) / 8.0;
+    sep_times.reserve(5);
+    for (int i = 0; i <= 4; ++i) {
+        const double u = static_cast<double>(i) / 4.0;
         sep_times.push_back(lerpd(sep_lo, sep_hi, u));
     }
     return sep_times;
@@ -1477,6 +2037,35 @@ GlobeSeries profile_to_globe(const Series& src, const MissionRequest& request, d
     return gs;
 }
 
+GlobePt globe_from_eci_r_km(const Vec3& r_km, double earth_rotation_angle_deg) {
+    const double rn = std::max(1e-9, norm3(r_km));
+    GlobePt gp;
+    gp.lat_deg = rad2deg(std::asin(clampd(r_km.z / rn, -1.0, 1.0)));
+    gp.lon_deg = wrap_lon_deg(rad2deg(std::atan2(r_km.y, r_km.x)) - earth_rotation_angle_deg);
+    gp.alt_km = std::max(0.0, rn - (kRe / 1000.0));
+    return gp;
+}
+
+GlobePt globe_from_eci_r_m(const Vec3& r_m, double earth_rotation_angle_deg) {
+    return globe_from_eci_r_km(r_m / 1000.0, earth_rotation_angle_deg);
+}
+
+GlobeSeries traj3d_to_globe(
+    const std::wstring& name,
+    COLORREF color,
+    const std::vector<SimPt3D>& traj,
+    double earth_rotation_angle_deg) {
+    GlobeSeries gs;
+    gs.name = name;
+    gs.color = color;
+    gs.pts.reserve(traj.size());
+    for (const SimPt3D& pt : traj) {
+        GlobePt gp = globe_from_eci_r_m(pt.r_m, earth_rotation_angle_deg);
+        if (finite_globe_pt(gp)) gs.pts.push_back(gp);
+    }
+    return gs;
+}
+
 bool stage2_insertion_display_anchor(const MissionResult& result, GlobePt& anchor, Vec3& horiz) {
     for (const GlobeSeries& series : result.globe_series) {
         if (series.name != L"Stage2 Insertion" || series.pts.size() < 2) continue;
@@ -1516,46 +2105,56 @@ void append_post_orbit_series(MissionResult& result, const MissionRequest& reque
     if (!stage2.orbit_ok) return;
 
     GlobePt insertion_gp{};
-    destination_from_course(
-        request.lat_deg,
-        result.launch_lon_deg,
-        result.orbit_target.launch_az_deg,
-        std::max(0.0, stage2.seco.theta * (kRe / 1000.0)),
-        insertion_gp.lat_deg,
-        insertion_gp.lon_deg);
-    insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - kRe) / 1000.0);
+    Vec3 r_vec{};
+    Vec3 v_vec{};
+    const bool use_state3d = stage2.seco3d.valid;
+    if (use_state3d) {
+        insertion_gp = globe_from_eci_r_m(stage2.seco3d.r_m, request.earth_rotation_angle_deg);
+        r_vec = stage2.seco3d.r_m / 1000.0;
+        v_vec = stage2.seco3d.v_mps / 1000.0;
+    } else {
+        destination_from_course(
+            request.lat_deg,
+            result.launch_lon_deg,
+            result.orbit_target.launch_az_deg,
+            std::max(0.0, stage2.seco.theta * (kRe / 1000.0)),
+            insertion_gp.lat_deg,
+            insertion_gp.lon_deg);
+        insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - kRe) / 1000.0);
 
-    Vec3 horiz{};
-    if (!stage2_insertion_display_anchor(result, insertion_gp, horiz)) {
-        const Vec3 east = normalize3({-std::sin(deg2rad(insertion_gp.lon_deg)), std::cos(deg2rad(insertion_gp.lon_deg)), 0.0});
-        const Vec3 north = normalize3({
-            -std::sin(deg2rad(insertion_gp.lat_deg)) * std::cos(deg2rad(insertion_gp.lon_deg)),
-            -std::sin(deg2rad(insertion_gp.lat_deg)) * std::sin(deg2rad(insertion_gp.lon_deg)),
-            std::cos(deg2rad(insertion_gp.lat_deg))});
-        const double az_rad = deg2rad(result.orbit_target.launch_az_deg);
-        horiz = normalize3({
-            north.x * std::cos(az_rad) + east.x * std::sin(az_rad),
-            north.y * std::cos(az_rad) + east.y * std::sin(az_rad),
-            north.z * std::cos(az_rad) + east.z * std::sin(az_rad),
+        Vec3 horiz{};
+        if (!stage2_insertion_display_anchor(result, insertion_gp, horiz)) {
+            const Vec3 east = normalize3({-std::sin(deg2rad(insertion_gp.lon_deg)), std::cos(deg2rad(insertion_gp.lon_deg)), 0.0});
+            const Vec3 north = normalize3({
+                -std::sin(deg2rad(insertion_gp.lat_deg)) * std::cos(deg2rad(insertion_gp.lon_deg)),
+                -std::sin(deg2rad(insertion_gp.lat_deg)) * std::sin(deg2rad(insertion_gp.lon_deg)),
+                std::cos(deg2rad(insertion_gp.lat_deg))});
+            const double az_rad = deg2rad(result.orbit_target.launch_az_deg);
+            horiz = normalize3({
+                north.x * std::cos(az_rad) + east.x * std::sin(az_rad),
+                north.y * std::cos(az_rad) + east.y * std::sin(az_rad),
+                north.z * std::cos(az_rad) + east.z * std::sin(az_rad),
+            });
+        }
+        insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - kRe) / 1000.0);
+        const Vec3 rhat_orbit = normalize3(ecef_from_geo(insertion_gp.lat_deg, insertion_gp.lon_deg, 0.0));
+        const double fpa_rad = deg2rad(stage2.orbit.flight_path_deg);
+        const Vec3 vdir = normalize3({
+            horiz.x * std::cos(fpa_rad) + rhat_orbit.x * std::sin(fpa_rad),
+            horiz.y * std::cos(fpa_rad) + rhat_orbit.y * std::sin(fpa_rad),
+            horiz.z * std::cos(fpa_rad) + rhat_orbit.z * std::sin(fpa_rad),
         });
-    }
-    insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - kRe) / 1000.0);
-    const Vec3 rhat_orbit = normalize3(ecef_from_geo(insertion_gp.lat_deg, insertion_gp.lon_deg, 0.0));
-    const double fpa_rad = deg2rad(stage2.orbit.flight_path_deg);
-    const Vec3 vdir = normalize3({
-        horiz.x * std::cos(fpa_rad) + rhat_orbit.x * std::sin(fpa_rad),
-        horiz.y * std::cos(fpa_rad) + rhat_orbit.y * std::sin(fpa_rad),
-        horiz.z * std::cos(fpa_rad) + rhat_orbit.z * std::sin(fpa_rad),
-    });
 
-    const double rmag_km = stage2.seco.r / 1000.0;
-    const double speed_kmps = stage2.orbit.speed_mps / 1000.0;
-    const Vec3 r_vec{rmag_km * rhat_orbit.x, rmag_km * rhat_orbit.y, rmag_km * rhat_orbit.z};
-    const Vec3 v_vec{speed_kmps * vdir.x, speed_kmps * vdir.y, speed_kmps * vdir.z};
+        const double rmag_km = stage2.seco.r / 1000.0;
+        const double speed_kmps = stage2.orbit.speed_mps / 1000.0;
+        r_vec = {rmag_km * rhat_orbit.x, rmag_km * rhat_orbit.y, rmag_km * rhat_orbit.z};
+        v_vec = {speed_kmps * vdir.x, speed_kmps * vdir.y, speed_kmps * vdir.z};
+    }
     const Vec3 h_vec = cross3(r_vec, v_vec);
     const double h_norm = std::sqrt(dot3(h_vec, h_vec));
     if (h_norm <= 1e-8) return;
 
+    const double rmag_km = std::max(1e-9, norm3(r_vec));
     const Vec3 h_hat = normalize3(h_vec);
     const Vec3 e_vec = {
         (v_vec.y * h_vec.z - v_vec.z * h_vec.y) / kMuKm - r_vec.x / std::max(1e-9, rmag_km),
@@ -1591,9 +2190,13 @@ void append_post_orbit_series(MissionResult& result, const MissionRequest& reque
         };
         const double qn = std::sqrt(dot3(q, q));
         GlobePt gp{};
-        gp.lat_deg = rad2deg(std::asin(clampd(q.z / std::max(1e-9, qn), -1.0, 1.0)));
-        gp.lon_deg = wrap_lon_deg(rad2deg(std::atan2(q.y, q.x)));
-        gp.alt_km = std::max(0.0, qn - (kRe / 1000.0));
+        if (use_state3d) {
+            gp = globe_from_eci_r_km(q, request.earth_rotation_angle_deg);
+        } else {
+            gp.lat_deg = rad2deg(std::asin(clampd(q.z / std::max(1e-9, qn), -1.0, 1.0)));
+            gp.lon_deg = wrap_lon_deg(rad2deg(std::atan2(q.y, q.x)));
+            gp.alt_km = std::max(0.0, qn - (kRe / 1000.0));
+        }
         post_orbit.pts.push_back(gp);
     }
     result.globe_series.push_back(std::move(post_orbit));
@@ -1631,6 +2234,43 @@ OrbitMetrics orbit_metrics_from_state(const PolarState& s) {
     return out;
 }
 
+OrbitMetrics orbit_metrics_from_state3d(const StateVector3D& s) {
+    OrbitMetrics out;
+    if (!s.valid) return out;
+
+    const double r_m = std::max(1.0, norm3(s.r_m));
+    const double speed_mps = norm3(s.v_mps);
+    const Vec3 r_hat = s.r_m / r_m;
+    const double vr_mps = dot3(s.v_mps, r_hat);
+    const double vt_mps = std::sqrt(std::max(0.0, speed_mps * speed_mps - vr_mps * vr_mps));
+    out.speed_mps = speed_mps;
+    out.flight_path_deg = rad2deg(std::atan2(vr_mps, std::max(1e-9, vt_mps)));
+
+    const double r_km = r_m / 1000.0;
+    const double v_kmps = speed_mps / 1000.0;
+    const Vec3 r_km_vec = s.r_m / 1000.0;
+    const Vec3 v_kmps_vec = s.v_mps / 1000.0;
+    const Vec3 h_vec = cross3(r_km_vec, v_kmps_vec);
+    const double h2 = dot3(h_vec, h_vec);
+    const double energy = 0.5 * v_kmps * v_kmps - kMuKm / std::max(1e-9, r_km);
+    const double ecc_sq = std::max(0.0, 1.0 + (2.0 * energy * h2) / (kMuKm * kMuKm));
+    out.e = std::sqrt(ecc_sq);
+    if (std::abs(energy) > 1e-12) {
+        out.a_km = -kMuKm / (2.0 * energy);
+    } else {
+        out.a_km = std::numeric_limits<double>::infinity();
+    }
+
+    if (std::isfinite(out.a_km) && out.a_km > 0.0) {
+        out.rp_km = std::max(0.0, out.a_km * (1.0 - out.e) - (kRe / 1000.0));
+        out.ra_km = std::max(0.0, out.a_km * (1.0 + out.e) - (kRe / 1000.0));
+    } else {
+        out.rp_km = std::max(0.0, r_km - (kRe / 1000.0));
+        out.ra_km = out.rp_km;
+    }
+    return out;
+}
+
 OrbitTarget build_orbit_target(const MissionRequest& request) {
     OrbitTarget out;
     out.rp_km = std::min(request.perigee_km, request.apogee_km);
@@ -1641,6 +2281,28 @@ OrbitTarget build_orbit_target(const MissionRequest& request) {
         out.ra_km);
 
     out.launch_az_deg = direct_launch_azimuth_deg(request.lat_deg, request.incl_deg);
+    {
+        const double lat = deg2rad(request.lat_deg);
+        const double lon = deg2rad(wrap_lon_deg(request.launch_lon_deg + request.earth_rotation_angle_deg));
+        const double az = deg2rad(out.launch_az_deg);
+        out.launch_rhat_eci = normalize3({
+            std::cos(lat) * std::cos(lon),
+            std::cos(lat) * std::sin(lon),
+            std::sin(lat),
+        });
+        out.launch_east_eci = normalize3({-std::sin(lon), std::cos(lon), 0.0});
+        out.launch_north_eci = normalize3({
+            -std::sin(lat) * std::cos(lon),
+            -std::sin(lat) * std::sin(lon),
+            std::cos(lat),
+        });
+        out.launch_tangent_eci = normalize3(out.launch_north_eci * std::cos(az) + out.launch_east_eci * std::sin(az));
+        out.plane_normal_eci = normalize3(cross3(out.launch_rhat_eci, out.launch_tangent_eci));
+        if (dot3(out.plane_normal_eci, out.plane_normal_eci) < 1e-10) {
+            out.plane_normal_eci = {0.0, 0.0, 1.0};
+        }
+        out.has_3d_plane = true;
+    }
 
     const double rp = kRe + out.rp_km * 1000.0;
     const double ra = kRe + out.ra_km * 1000.0;
@@ -1697,6 +2359,11 @@ MissionRequest sanitize_request(const MissionRequest& request) {
 }
 
 MissionResult solve_mission(const MissionRequest& request_in, SolveControl control) {
+    MissionProfile& profile = mission_profile();
+    const bool profile_enabled = mission_profile_requested();
+    profile.reset(profile_enabled);
+    const ProfileClock::time_point solve_profile_start = ProfileClock::now();
+
     const MissionRequest request = sanitize_request(request_in);
     const bool recovery_required = !control.ignore_recovery;
     MissionResult result;
@@ -1709,7 +2376,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
     lvd_options.allow_full_burn = !recovery_required || control.force_stage1_burnout;
     lvd_options.force_stage1_burnout = control.force_stage1_burnout;
     lvd_options.cancel_requested = control.cancel_requested;
-    lvd_options.max_mission_design_evals = control.force_stage1_burnout ? 8 : 72;
+    lvd_options.max_mission_design_evals = control.force_stage1_burnout ? 6 : 18;
     lvd_options.mission_score = [&](const LvdResult& candidate_lvd) {
         if (candidate_lvd.state_samples.empty() || !candidate_lvd.stage1.converged) {
             return std::numeric_limits<double>::infinity();
@@ -1718,16 +2385,24 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
         if (sep_times.empty()) return std::numeric_limits<double>::infinity();
         SolveControl lvd_score_control = control;
         lvd_score_control.worker_count = 1;
-        SepSearchResult search = search_lvd_sep_samples(
-            request,
-            result.orbit_target,
-            candidate_lvd,
-            sep_times,
-            lvd_score_control,
-            nullptr);
+        SepSearchResult search;
+        {
+            ScopedProfile search_scope(profile.lvd_mission_search, profile.enabled);
+            search = search_lvd_sep_samples(
+                request,
+                result.orbit_target,
+                candidate_lvd,
+                sep_times,
+                lvd_score_control,
+                nullptr);
+        }
         return score_lvd_search_result(search, recovery_required);
     };
-    const LvdResult lvd = solve_stage1_lvd(request, result.orbit_target, lvd_options);
+    LvdResult lvd;
+    {
+        ScopedProfile lvd_scope(profile.lvd_total, profile.enabled);
+        lvd = solve_stage1_lvd(request, result.orbit_target, lvd_options);
+    }
 
     result.lvd_time_series = lvd.time_series;
     result.lvd_events = lvd.events;
@@ -1741,6 +2416,18 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
     std::vector<SeparationCandidate> sep_sweep_samples;
     SeparationCandidate best;
     bool best_is_accepted = false;
+    auto timed_final_sep_search = [&](
+        const std::vector<double>& sep_times,
+        std::vector<SeparationCandidate>* sample_out) {
+        ScopedProfile search_scope(profile.final_sep_search, profile.enabled);
+        return search_lvd_sep_samples(
+            request,
+            result.orbit_target,
+            lvd,
+            sep_times,
+            control,
+            sample_out);
+    };
     auto promote_best_from_search = [&](const SepSearchResult& search, bool allow_marginal_fallback) {
         if (std::isfinite(search.accepted_best.score)) {
             if (!best_is_accepted || candidate_better(search.accepted_best, best, request, true, recovery_required)) {
@@ -1772,13 +2459,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
 
     if (control.force_stage1_burnout) {
         const std::vector<double> burnout_sep_times{sep_hi};
-        SepSearchResult burnout_search = search_lvd_sep_samples(
-            request,
-            result.orbit_target,
-            lvd,
-            burnout_sep_times,
-            control,
-            &sep_sweep_samples);
+        SepSearchResult burnout_search = timed_final_sep_search(burnout_sep_times, &sep_sweep_samples);
         promote_best_from_search(burnout_search, true);
     } else if (control.separation_search_mode == SeparationSearchMode::Coarse1s) {
         constexpr double kCoarseSepStepS = 1.0;
@@ -1791,13 +2472,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
         if (coarse_sep_times.empty() || std::abs(coarse_sep_times.back() - sep_hi) > 1e-6) {
             coarse_sep_times.push_back(sep_hi);
         }
-        SepSearchResult coarse_search = search_lvd_sep_samples(
-            request,
-            result.orbit_target,
-            lvd,
-            coarse_sep_times,
-            control,
-            &sep_sweep_samples);
+        SepSearchResult coarse_search = timed_final_sep_search(coarse_sep_times, &sep_sweep_samples);
         promote_best_from_search(coarse_search, true);
     } else {
         std::vector<double> coarse_sep_times;
@@ -1806,13 +2481,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
             const double u = static_cast<double>(i) / 8.0;
             coarse_sep_times.push_back(lerpd(sep_lo, sep_hi, u));
         }
-        SepSearchResult coarse_search = search_lvd_sep_samples(
-            request,
-            result.orbit_target,
-            lvd,
-            coarse_sep_times,
-            control,
-            &sep_sweep_samples);
+        SepSearchResult coarse_search = timed_final_sep_search(coarse_sep_times, &sep_sweep_samples);
         promote_best_from_search(coarse_search, true);
 
         std::vector<double> refine_seed_times;
@@ -1831,13 +2500,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
 
         if (refine_seed_times.empty() && !cancellation_requested(control)) {
             const std::vector<double> fallback_sep_time{0.5 * (sep_lo + sep_hi)};
-            SepSearchResult fallback_search = search_lvd_sep_samples(
-                request,
-                result.orbit_target,
-                lvd,
-                fallback_sep_time,
-                control,
-                &sep_sweep_samples);
+            SepSearchResult fallback_search = timed_final_sep_search(fallback_sep_time, &sep_sweep_samples);
             promote_best_from_search(fallback_search, true);
             add_refine_seed_time(fallback_search.accepted_best);
             add_refine_seed_time(fallback_search.orbit_seed_best);
@@ -1856,13 +2519,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
                 const double u = static_cast<double>(i) / 8.0;
                 refine_sep_times.push_back(lerpd(refine_lo, refine_hi, u));
             }
-            SepSearchResult refined = search_lvd_sep_samples(
-                request,
-                result.orbit_target,
-                lvd,
-                refine_sep_times,
-                control,
-                &sep_sweep_samples);
+            SepSearchResult refined = timed_final_sep_search(refine_sep_times, &sep_sweep_samples);
             promote_best_from_search(refined, false);
         }
     }
@@ -1880,171 +2537,189 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
         } else {
             result.lines.push_back(L"[LVD] Stage1 LVD did not produce a finite SEP candidate; recovery constraints were ignored for this mode.");
         }
+        if (profile.enabled) {
+            profile.solve_total.add(ProfileClock::now() - solve_profile_start);
+            print_mission_profile(profile);
+        }
         return result;
     }
 
-    result.best_candidate = best;
-    result.stage1 = best.stage1;
-    result.stage2 = best.stage2;
-    result.recovery = best.recovery;
-    append_separation_time_series(result, std::move(sep_sweep_samples));
-    if (std::isfinite(best.score) && recovery_required) {
-        result.ship_lat_deg = best.recovery.touchdown_lat_deg;
-        result.ship_lon_deg = best.recovery.touchdown_lon_deg;
-        result.view_lat_deg = 0.5 * (result.launch_lat_deg + result.ship_lat_deg);
-        result.view_lon_deg = wrap_lon_deg(result.launch_lon_deg + 0.5 * (result.ship_lon_deg - result.launch_lon_deg));
-    } else {
-        result.ship_lat_deg = result.launch_lat_deg;
-        result.ship_lon_deg = result.launch_lon_deg;
-        result.view_lat_deg = result.launch_lat_deg;
-        result.view_lon_deg = result.launch_lon_deg;
-    }
+    {
+        ScopedProfile report_scope(profile.report_build, profile.enabled);
 
-    const bool numeric_ok = result.stage1.converged && result.stage2.converged;
-    const bool orbit_ok = result.stage2.orbit_ok;
-    const bool recovery_ok = (!recovery_required) || result.recovery.feasible;
-    const bool q_ok = result.stage1.max_q <= request.q_limit_kpa + 1e-6;
-    result.payload_search_ok = numeric_ok && orbit_ok && recovery_ok;
-    result.ok = result.payload_search_ok && q_ok;
-
-    if (result.ok) {
-        result.status = recovery_required ? L"FEASIBLE" : L"FEASIBLE / NO RECOVERY";
-    } else if (result.payload_search_ok) {
-        result.status = recovery_required ? L"FEASIBLE / Q-LIMIT" : L"FEASIBLE / NO RECOVERY / Q-LIMIT";
-    } else if (recovery_required && numeric_ok && orbit_ok && !result.recovery.feasible) {
-        // Stage 2 reached orbit (UPFG insertion succeeded), but Stage 1 cannot land
-        // with the propellant left after burn-out separation.  Surface this as a
-        // distinct status so the GUI still shows the insertion trajectory instead of
-        // a generic "not feasible" message.
-        result.status = q_ok ? L"ORBIT OK / RECOVERY INFEASIBLE"
-                              : L"ORBIT OK / RECOVERY INFEASIBLE / Q-LIMIT";
-    } else {
-        result.status = L"MARGINAL / NOT FEASIBLE";
-    }
-
-    const double sep_alt = (result.stage1.sep.r - kRe) / 1000.0;
-    const double sep_speed = std::hypot(result.stage1.sep.vr, result.stage1.sep.vt);
-    const double sep_gamma = rad2deg(std::atan2(result.stage1.sep.vr, std::max(1.0, result.stage1.sep.vt)));
-
-    result.lines.push_back(L"[Status] " + result.status);
-    append_orbit_target_report(result.lines, request, result.orbit_target);
-    if (!recovery_required) {
-        result.lines.push_back(L"[Mode] No recovery; Stage1 burns to depletion before separation.");
-    }
-    result.lines.push_back(
-        L"[LVD Window] offset=" + fnum(result.lvd_launch_offset_s, 1) +
-        L" s, earth_rotation=" + fnum(result.lvd_earth_rotation_angle_deg, 3) +
-        L" deg, launch_RAAN=" + fnum(result.lvd_launch_raan_deg, 3) +
-        L" deg, target_RAAN=" + fnum(result.lvd_target_raan_deg, 3) +
-        L" deg, plane_err=" + fnum(result.lvd_plane_error_deg, 4) + L" deg");
-    result.lines.push_back(
-        L"[Stage1 LVD Target] sep=" + fnum(best.sep_time_s, 1) +
-        L" s, tgt_alt=" + fnum(best.sep_alt_target_km, 1) +
-        L" km, tgt_speed=" + fnum(best.sep_speed_target_mps, 0) +
-        L" m/s, tgt_gamma=" + fnum(best.sep_gamma_target_deg, 1) + L" deg");
-    result.lines.push_back(
-        L"[Stage1 LVD] MECO=" + fnum(result.stage1.meco_s, 1) +
-        L" s, separation=" + fnum(result.stage1.sep_s, 1) +
-        L" s, sep_alt=" + fnum(sep_alt, 2) +
-        L" km, sep_speed=" + fnum(sep_speed, 1) +
-        L" m/s, sep_gamma=" + fnum(sep_gamma, 2) + L" deg");
-    result.lines.push_back(
-        L"[Stage1 Guidance] guide_start=" + fnum(result.stage1.guide_start_s, 1) +
-        L" s, tgo_final=" + fnum(result.stage1.tgo_final_s, 1) +
-        L" s, vgo_final=" + fnum(result.stage1.vgo_final_mps, 1) +
-        L" m/s, maxQ=" + fnum(result.stage1.max_q, 2) + L" kPa");
-    result.lines.push_back(
-        L"[Stage1 Errors] alt=" + fnum(result.stage1.target_alt_err_km, 2) +
-        L" km, speed=" + fnum(result.stage1.target_speed_err_mps, 1) +
-        L" m/s, gamma=" + fnum(result.stage1.target_gamma_err_deg, 2) + L" deg");
-    result.lines.push_back(
-        L"[Stage2 UPFG] ignition=" + fnum(result.stage2.ignition_s, 1) +
-        L" s, burn=" + fnum(result.stage2.burn_s, 1) +
-        L" s, SECO=" + fnum(result.stage2.cutoff_s, 1) +
-        L" s, tgo_final=" + fnum(result.stage2.tgo_final_s, 1) +
-        L" s, vgo_final=" + fnum(result.stage2.vgo_final_mps, 1) + L" m/s");
-    result.lines.push_back(
-        L"[Stage2 Orbit] actual_rp=" + fnum(result.stage2.orbit.rp_km, 1) +
-        L" km, actual_ra=" + fnum(result.stage2.orbit.ra_km, 1) +
-        L" km, actual_cutoff_alt=" + fnum((result.stage2.seco.r - kRe) / 1000.0, 1) +
-        L" km, flight_path=" + fnum(result.stage2.orbit.flight_path_deg, 2) + L" deg");
-    result.lines.push_back(
-        L"[Stage2 Errors] rp=" + fnum(result.stage2.target_rp_err_km, 1) +
-        L" km, ra=" + fnum(result.stage2.target_ra_err_km, 1) +
-        L" km, cutoff=" + fnum(result.stage2.target_r_err_km, 1) +
-        L" km, fpa=" + fnum(result.stage2.target_fpa_err_deg, 2) + L" deg");
-    result.lines.push_back(
-        L"[Reserve Fuel] Stage1=" + fnum(result.stage1.rem_prop, 1) +
-        L" kg, Stage2=" + fnum(result.stage2.rem_prop, 1) + L" kg");
-    result.lines.push_back(
-        L"[Reserve Objective] maximize Stage2 remaining propellant = " +
-        fnum(result.stage2.rem_prop, 1) + L" kg (" +
-        fnum(100.0 * candidate_stage2_reserve_score(best, request), 3) + L"%)");
-    if (recovery_required) {
-        result.lines.push_back(
-            L"[Recovery Coast] ignition=" +
-            (std::isfinite(result.recovery.landing_ignition_time_s) ? ftime(result.recovery.landing_ignition_time_s) : std::wstring(L"N/A")) +
-            L", touchdown=" + ftime(result.recovery.touchdown_time_s) +
-            L", touchdown_downrange=" + fnum(result.recovery.touchdown_downrange_km, 1) + L" km");
-        result.lines.push_back(
-            L"[Landing Burn] prop=" + fnum(result.recovery.landing_prop_kg, 1) +
-            L" kg, margin=" + fnum(result.recovery.margin_kg, 1) +
-            L" kg, touchdown_speed=" + fnum(result.recovery.touchdown_speed_mps, 1) + L" m/s");
-        result.lines.push_back(
-            L"[Recovery Ship LL] lat=" + fnum(result.recovery.touchdown_lat_deg, 6) +
-            L", lon=" + fnum(result.recovery.touchdown_lon_deg, 6) +
-            L" (propagated touchdown)");
-        result.lines.push_back(
-            L"[Compatibility] input ship_downrange_km=" + fnum(request.ship_downrange_km, 1) +
-            L" km retained for parsing only; automatic ship placement now follows propagated touchdown.");
-    } else {
-        result.lines.push_back(L"[Recovery] Ignored; Stage1 is expended after burnout separation.");
-    }
-    result.lines.push_back(L"[Timeline] " + ftime(0.0) + L" Liftoff");
-    result.lines.push_back(L"[Timeline] " + ftime(result.stage1.t_max_q) + L" Max-Q");
-    result.lines.push_back(L"[Timeline] " + ftime(result.stage1.meco_s) + L" MECO");
-    result.lines.push_back(L"[Timeline] " + ftime(result.stage1.sep_s) + L" Stage Separation");
-    result.lines.push_back(L"[Timeline] " + ftime(result.stage2.ignition_s) + L" Stage2 Ignition");
-    result.lines.push_back(L"[Timeline] " + ftime(result.stage2.cutoff_s) + L" Stage2 SECO");
-    if (recovery_required && std::isfinite(result.recovery.landing_ignition_time_s)) {
-        result.lines.push_back(L"[Timeline] " + ftime(result.recovery.landing_ignition_time_s) + L" Landing Ignition");
-    }
-    if (recovery_required) {
-        result.lines.push_back(L"[Timeline] " + ftime(result.recovery.touchdown_time_s) + L" Touchdown");
-    }
-
-    Series ascent;
-    ascent.name = L"Stage1 LVD Ascent";
-    ascent.color = RGB(41, 128, 185);
-    for (const SimPt& pt : result.stage1.traj) ascent.pts.push_back({pt.x_km, pt.z_km});
-    result.profile_series.push_back(std::move(ascent));
-
-    if (recovery_required) {
-        Series coast;
-        coast.name = L"Recovery Coast";
-        coast.color = RGB(39, 174, 96);
-        for (const SimPt& pt : result.recovery.coast_traj) coast.pts.push_back({pt.x_km, pt.z_km});
-        result.profile_series.push_back(std::move(coast));
-
-        if (!result.recovery.landing_traj.empty()) {
-            Series landing;
-            landing.name = L"Landing Burn";
-            landing.color = RGB(22, 160, 133);
-            for (const SimPt& pt : result.recovery.landing_traj) landing.pts.push_back({pt.x_km, pt.z_km});
-            result.profile_series.push_back(std::move(landing));
+        result.best_candidate = best;
+        result.stage1 = best.stage1;
+        result.stage2 = best.stage2;
+        result.recovery = best.recovery;
+        append_separation_time_series(result, std::move(sep_sweep_samples));
+        if (std::isfinite(best.score) && recovery_required) {
+            result.ship_lat_deg = best.recovery.touchdown_lat_deg;
+            result.ship_lon_deg = best.recovery.touchdown_lon_deg;
+            result.view_lat_deg = 0.5 * (result.launch_lat_deg + result.ship_lat_deg);
+            result.view_lon_deg = wrap_lon_deg(result.launch_lon_deg + 0.5 * (result.ship_lon_deg - result.launch_lon_deg));
+        } else {
+            result.ship_lat_deg = result.launch_lat_deg;
+            result.ship_lon_deg = result.launch_lon_deg;
+            result.view_lat_deg = result.launch_lat_deg;
+            result.view_lon_deg = result.launch_lon_deg;
         }
-    }
 
-    Series insertion;
-    insertion.name = L"Stage2 Insertion";
-    insertion.color = RGB(192, 57, 43);
-    for (const SimPt& pt : result.stage2.traj) insertion.pts.push_back({pt.x_km, pt.z_km});
-    result.profile_series.push_back(std::move(insertion));
+        const bool numeric_ok = result.stage1.converged && result.stage2.converged;
+        const bool orbit_ok = result.stage2.orbit_ok;
+        const bool recovery_ok = (!recovery_required) || result.recovery.feasible;
+        const bool q_ok = result.stage1.max_q <= request.q_limit_kpa + 1e-6;
+        result.payload_search_ok = numeric_ok && orbit_ok && recovery_ok;
+        result.ok = result.payload_search_ok && q_ok;
 
-    for (const Series& series : result.profile_series) {
-        result.globe_series.push_back(profile_to_globe(series, request, result.orbit_target.launch_az_deg, result.launch_lon_deg));
+        if (result.ok) {
+            result.status = recovery_required ? L"FEASIBLE" : L"FEASIBLE / NO RECOVERY";
+        } else if (result.payload_search_ok) {
+            result.status = recovery_required ? L"FEASIBLE / Q-LIMIT" : L"FEASIBLE / NO RECOVERY / Q-LIMIT";
+        } else if (recovery_required && numeric_ok && orbit_ok && !result.recovery.feasible) {
+            // Stage 2 reached orbit (UPFG insertion succeeded), but Stage 1 cannot land
+            // with the propellant left after burn-out separation.  Surface this as a
+            // distinct status so the GUI still shows the insertion trajectory instead of
+            // a generic "not feasible" message.
+            result.status = q_ok ? L"ORBIT OK / RECOVERY INFEASIBLE"
+                                  : L"ORBIT OK / RECOVERY INFEASIBLE / Q-LIMIT";
+        } else {
+            result.status = L"MARGINAL / NOT FEASIBLE";
+        }
+
+        const double sep_alt = (result.stage1.sep.r - kRe) / 1000.0;
+        const double sep_speed = std::hypot(result.stage1.sep.vr, result.stage1.sep.vt);
+        const double sep_gamma = rad2deg(std::atan2(result.stage1.sep.vr, std::max(1.0, result.stage1.sep.vt)));
+
+        result.lines.push_back(L"[Status] " + result.status);
+        append_orbit_target_report(result.lines, request, result.orbit_target);
+        if (!recovery_required) {
+            result.lines.push_back(L"[Mode] No recovery; Stage1 burns to depletion before separation.");
+        }
+        result.lines.push_back(
+            L"[LVD Window] offset=" + fnum(result.lvd_launch_offset_s, 1) +
+            L" s, earth_rotation=" + fnum(result.lvd_earth_rotation_angle_deg, 3) +
+            L" deg, launch_RAAN=" + fnum(result.lvd_launch_raan_deg, 3) +
+            L" deg, target_RAAN=" + fnum(result.lvd_target_raan_deg, 3) +
+            L" deg, plane_err=" + fnum(result.lvd_plane_error_deg, 4) + L" deg");
+        result.lines.push_back(
+            L"[Stage1 LVD Target] sep=" + fnum(best.sep_time_s, 1) +
+            L" s, tgt_alt=" + fnum(best.sep_alt_target_km, 1) +
+            L" km, tgt_speed=" + fnum(best.sep_speed_target_mps, 0) +
+            L" m/s, tgt_gamma=" + fnum(best.sep_gamma_target_deg, 1) + L" deg");
+        result.lines.push_back(
+            L"[Stage1 LVD] MECO=" + fnum(result.stage1.meco_s, 1) +
+            L" s, separation=" + fnum(result.stage1.sep_s, 1) +
+            L" s, sep_alt=" + fnum(sep_alt, 2) +
+            L" km, sep_speed=" + fnum(sep_speed, 1) +
+            L" m/s, sep_gamma=" + fnum(sep_gamma, 2) + L" deg");
+        result.lines.push_back(
+            L"[Stage1 Guidance] guide_start=" + fnum(result.stage1.guide_start_s, 1) +
+            L" s, tgo_final=" + fnum(result.stage1.tgo_final_s, 1) +
+            L" s, vgo_final=" + fnum(result.stage1.vgo_final_mps, 1) +
+            L" m/s, maxQ=" + fnum(result.stage1.max_q, 2) + L" kPa");
+        result.lines.push_back(
+            L"[Stage1 Errors] alt=" + fnum(result.stage1.target_alt_err_km, 2) +
+            L" km, speed=" + fnum(result.stage1.target_speed_err_mps, 1) +
+            L" m/s, gamma=" + fnum(result.stage1.target_gamma_err_deg, 2) + L" deg");
+        result.lines.push_back(
+            L"[Stage2 UPFG] ignition=" + fnum(result.stage2.ignition_s, 1) +
+            L" s, burn=" + fnum(result.stage2.burn_s, 1) +
+            L" s, SECO=" + fnum(result.stage2.cutoff_s, 1) +
+            L" s, tgo_final=" + fnum(result.stage2.tgo_final_s, 1) +
+            L" s, vgo_final=" + fnum(result.stage2.vgo_final_mps, 1) + L" m/s");
+        result.lines.push_back(
+            L"[Stage2 Orbit] actual_rp=" + fnum(result.stage2.orbit.rp_km, 1) +
+            L" km, actual_ra=" + fnum(result.stage2.orbit.ra_km, 1) +
+            L" km, actual_cutoff_alt=" + fnum((result.stage2.seco.r - kRe) / 1000.0, 1) +
+            L" km, flight_path=" + fnum(result.stage2.orbit.flight_path_deg, 2) + L" deg");
+        result.lines.push_back(
+            L"[Stage2 Errors] rp=" + fnum(result.stage2.target_rp_err_km, 1) +
+            L" km, ra=" + fnum(result.stage2.target_ra_err_km, 1) +
+            L" km, cutoff=" + fnum(result.stage2.target_r_err_km, 1) +
+            L" km, fpa=" + fnum(result.stage2.target_fpa_err_deg, 2) + L" deg");
+        result.lines.push_back(
+            L"[Reserve Fuel] Stage1=" + fnum(result.stage1.rem_prop, 1) +
+            L" kg, Stage2=" + fnum(result.stage2.rem_prop, 1) + L" kg");
+        result.lines.push_back(
+            L"[Reserve Objective] maximize Stage2 remaining propellant = " +
+            fnum(result.stage2.rem_prop, 1) + L" kg (" +
+            fnum(100.0 * candidate_stage2_reserve_score(best, request), 3) + L"%)");
+        if (recovery_required) {
+            result.lines.push_back(
+                L"[Recovery Coast] ignition=" +
+                (std::isfinite(result.recovery.landing_ignition_time_s) ? ftime(result.recovery.landing_ignition_time_s) : std::wstring(L"N/A")) +
+                L", touchdown=" + ftime(result.recovery.touchdown_time_s) +
+                L", touchdown_downrange=" + fnum(result.recovery.touchdown_downrange_km, 1) + L" km");
+            result.lines.push_back(
+                L"[Landing Burn] prop=" + fnum(result.recovery.landing_prop_kg, 1) +
+                L" kg, margin=" + fnum(result.recovery.margin_kg, 1) +
+                L" kg, touchdown_speed=" + fnum(result.recovery.touchdown_speed_mps, 1) + L" m/s");
+            result.lines.push_back(
+                L"[Recovery Ship LL] lat=" + fnum(result.recovery.touchdown_lat_deg, 6) +
+                L", lon=" + fnum(result.recovery.touchdown_lon_deg, 6) +
+                L" (propagated touchdown)");
+            result.lines.push_back(
+                L"[Compatibility] input ship_downrange_km=" + fnum(request.ship_downrange_km, 1) +
+                L" km retained for parsing only; automatic ship placement now follows propagated touchdown.");
+        } else {
+            result.lines.push_back(L"[Recovery] Ignored; Stage1 is expended after burnout separation.");
+        }
+        result.lines.push_back(L"[Timeline] " + ftime(0.0) + L" Liftoff");
+        result.lines.push_back(L"[Timeline] " + ftime(result.stage1.t_max_q) + L" Max-Q");
+        result.lines.push_back(L"[Timeline] " + ftime(result.stage1.meco_s) + L" MECO");
+        result.lines.push_back(L"[Timeline] " + ftime(result.stage1.sep_s) + L" Stage Separation");
+        result.lines.push_back(L"[Timeline] " + ftime(result.stage2.ignition_s) + L" Stage2 Ignition");
+        result.lines.push_back(L"[Timeline] " + ftime(result.stage2.cutoff_s) + L" Stage2 SECO");
+        if (recovery_required && std::isfinite(result.recovery.landing_ignition_time_s)) {
+            result.lines.push_back(L"[Timeline] " + ftime(result.recovery.landing_ignition_time_s) + L" Landing Ignition");
+        }
+        if (recovery_required) {
+            result.lines.push_back(L"[Timeline] " + ftime(result.recovery.touchdown_time_s) + L" Touchdown");
+        }
+
+        Series ascent;
+        ascent.name = L"Stage1 LVD Ascent";
+        ascent.color = RGB(41, 128, 185);
+        for (const SimPt& pt : result.stage1.traj) ascent.pts.push_back({pt.x_km, pt.z_km});
+        result.profile_series.push_back(std::move(ascent));
+
+        if (recovery_required) {
+            Series coast;
+            coast.name = L"Recovery Coast";
+            coast.color = RGB(39, 174, 96);
+            for (const SimPt& pt : result.recovery.coast_traj) coast.pts.push_back({pt.x_km, pt.z_km});
+            result.profile_series.push_back(std::move(coast));
+
+            if (!result.recovery.landing_traj.empty()) {
+                Series landing;
+                landing.name = L"Landing Burn";
+                landing.color = RGB(22, 160, 133);
+                for (const SimPt& pt : result.recovery.landing_traj) landing.pts.push_back({pt.x_km, pt.z_km});
+                result.profile_series.push_back(std::move(landing));
+            }
+        }
+
+        Series insertion;
+        insertion.name = L"Stage2 Insertion";
+        insertion.color = RGB(192, 57, 43);
+        for (const SimPt& pt : result.stage2.traj) insertion.pts.push_back({pt.x_km, pt.z_km});
+        result.profile_series.push_back(std::move(insertion));
+
+        for (const Series& series : result.profile_series) {
+            if (series.name == L"Stage1 LVD Ascent" && !result.stage1.traj3d.empty()) {
+                result.globe_series.push_back(traj3d_to_globe(series.name, series.color, result.stage1.traj3d, request.earth_rotation_angle_deg));
+            } else if (series.name == L"Stage2 Insertion" && !result.stage2.traj3d.empty()) {
+                result.globe_series.push_back(traj3d_to_globe(series.name, series.color, result.stage2.traj3d, request.earth_rotation_angle_deg));
+            } else {
+                result.globe_series.push_back(profile_to_globe(series, request, result.orbit_target.launch_az_deg, result.launch_lon_deg));
+            }
+        }
+        append_post_orbit_series(result, request);
     }
-    append_post_orbit_series(result, request);
+    if (profile.enabled) {
+        profile.solve_total.add(ProfileClock::now() - solve_profile_start);
+        print_mission_profile(profile);
+    }
 
     return result;
 }

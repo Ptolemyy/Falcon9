@@ -11,6 +11,8 @@ struct LvdResult;
 struct LvdOptions {
     bool allow_full_burn = false;
     bool force_stage1_burnout = false;
+    SteeringModel3D steering_model;
+    ThrottleModel throttle_model;
     const std::atomic<bool>* cancel_requested = nullptr;
     std::function<double(const LvdResult&)> mission_score;
     int max_mission_design_evals = 0;

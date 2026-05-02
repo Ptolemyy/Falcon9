@@ -381,7 +381,7 @@ bool load_vehicle_config(const std::wstring& path, MissionRequest& out, std::wst
 }
 
 constexpr char kPlannerCacheMagic[] = {'F', '9', 'P', 'C', 'A', 'C', 'H', 'E'};
-constexpr uint32_t kPlannerCacheVersion = 3;
+constexpr uint32_t kPlannerCacheVersion = 6;
 constexpr uint64_t kMaxCacheEntries = 512;
 constexpr uint64_t kMaxCacheVectorItems = 1000000;
 constexpr uint64_t kMaxCacheTextChars = 1000000;
@@ -595,6 +595,40 @@ bool read_sim_pt(CacheReader& r, falcon9::SimPt& v) {
     return r.pod(v.t) && r.pod(v.x_km) && r.pod(v.z_km);
 }
 
+void write_vec3(CacheWriter& w, const falcon9::Vec3& v) {
+    w.pod(v.x);
+    w.pod(v.y);
+    w.pod(v.z);
+}
+
+bool read_vec3(CacheReader& r, falcon9::Vec3& v) {
+    return r.pod(v.x) && r.pod(v.y) && r.pod(v.z);
+}
+
+void write_state3d(CacheWriter& w, const falcon9::StateVector3D& v) {
+    write_vec3(w, v.r_m);
+    write_vec3(w, v.v_mps);
+    w.pod(v.m_kg);
+    write_bool(w, v.valid);
+}
+
+bool read_state3d(CacheReader& r, falcon9::StateVector3D& v) {
+    return read_vec3(r, v.r_m) &&
+           read_vec3(r, v.v_mps) &&
+           r.pod(v.m_kg) &&
+           read_bool(r, v.valid);
+}
+
+void write_sim_pt3d(CacheWriter& w, const falcon9::SimPt3D& v) {
+    w.pod(v.t);
+    write_vec3(w, v.r_m);
+    write_vec3(w, v.v_mps);
+}
+
+bool read_sim_pt3d(CacheReader& r, falcon9::SimPt3D& v) {
+    return r.pod(v.t) && read_vec3(r, v.r_m) && read_vec3(r, v.v_mps);
+}
+
 void write_globe_pt(CacheWriter& w, const GlobePt& v) {
     w.pod(v.lat_deg);
     w.pod(v.lon_deg);
@@ -646,6 +680,12 @@ void write_orbit_target(CacheWriter& w, const falcon9::OrbitTarget& v) {
     w.pod(v.vt_target_mps);
     w.pod(v.speed_target_mps);
     w.pod(v.fpa_target_deg);
+    write_vec3(w, v.launch_rhat_eci);
+    write_vec3(w, v.launch_east_eci);
+    write_vec3(w, v.launch_north_eci);
+    write_vec3(w, v.launch_tangent_eci);
+    write_vec3(w, v.plane_normal_eci);
+    write_bool(w, v.has_3d_plane);
 }
 
 bool read_orbit_target(CacheReader& r, falcon9::OrbitTarget& v) {
@@ -658,7 +698,13 @@ bool read_orbit_target(CacheReader& r, falcon9::OrbitTarget& v) {
         r.pod(v.vr_target_mps) &&
         r.pod(v.vt_target_mps) &&
         r.pod(v.speed_target_mps) &&
-        r.pod(v.fpa_target_deg);
+        r.pod(v.fpa_target_deg) &&
+        read_vec3(r, v.launch_rhat_eci) &&
+        read_vec3(r, v.launch_east_eci) &&
+        read_vec3(r, v.launch_north_eci) &&
+        read_vec3(r, v.launch_tangent_eci) &&
+        read_vec3(r, v.plane_normal_eci) &&
+        read_bool(r, v.has_3d_plane);
 }
 
 void write_sim_pts(CacheWriter& w, const std::vector<falcon9::SimPt>& pts) {
@@ -676,9 +722,26 @@ bool read_sim_pts(CacheReader& r, std::vector<falcon9::SimPt>& pts) {
     return true;
 }
 
+void write_sim_pts3d(CacheWriter& w, const std::vector<falcon9::SimPt3D>& pts) {
+    write_count(w, pts.size());
+    for (const auto& pt : pts) write_sim_pt3d(w, pt);
+}
+
+bool read_sim_pts3d(CacheReader& r, std::vector<falcon9::SimPt3D>& pts) {
+    size_t n = 0;
+    if (!read_count(r, n)) return false;
+    pts.resize(n);
+    for (auto& pt : pts) {
+        if (!read_sim_pt3d(r, pt)) return false;
+    }
+    return true;
+}
+
 void write_stage1_result(CacheWriter& w, const falcon9::Stage1Result& v) {
     write_polar_state(w, v.meco);
     write_polar_state(w, v.sep);
+    write_state3d(w, v.meco3d);
+    write_state3d(w, v.sep3d);
     w.pod(v.burn_s);
     w.pod(v.meco_s);
     w.pod(v.sep_s);
@@ -697,12 +760,15 @@ void write_stage1_result(CacheWriter& w, const falcon9::Stage1Result& v) {
     w.pod(v.tgo_final_s);
     w.pod(v.vgo_final_mps);
     write_sim_pts(w, v.traj);
+    write_sim_pts3d(w, v.traj3d);
 }
 
 bool read_stage1_result(CacheReader& r, falcon9::Stage1Result& v) {
     return
         read_polar_state(r, v.meco) &&
         read_polar_state(r, v.sep) &&
+        read_state3d(r, v.meco3d) &&
+        read_state3d(r, v.sep3d) &&
         r.pod(v.burn_s) &&
         r.pod(v.meco_s) &&
         r.pod(v.sep_s) &&
@@ -720,12 +786,15 @@ bool read_stage1_result(CacheReader& r, falcon9::Stage1Result& v) {
         r.pod(v.target_gamma_err_deg) &&
         r.pod(v.tgo_final_s) &&
         r.pod(v.vgo_final_mps) &&
-        read_sim_pts(r, v.traj);
+        read_sim_pts(r, v.traj) &&
+        read_sim_pts3d(r, v.traj3d);
 }
 
 void write_stage2_result(CacheWriter& w, const falcon9::Stage2Result& v) {
     write_polar_state(w, v.ignition);
     write_polar_state(w, v.seco);
+    write_state3d(w, v.ignition3d);
+    write_state3d(w, v.seco3d);
     write_orbit_metrics(w, v.orbit);
     w.pod(v.ignition_s);
     w.pod(v.burn_s);
@@ -743,12 +812,15 @@ void write_stage2_result(CacheWriter& w, const falcon9::Stage2Result& v) {
     w.pod(v.tgo_final_s);
     w.pod(v.vgo_final_mps);
     write_sim_pts(w, v.traj);
+    write_sim_pts3d(w, v.traj3d);
 }
 
 bool read_stage2_result(CacheReader& r, falcon9::Stage2Result& v) {
     return
         read_polar_state(r, v.ignition) &&
         read_polar_state(r, v.seco) &&
+        read_state3d(r, v.ignition3d) &&
+        read_state3d(r, v.seco3d) &&
         read_orbit_metrics(r, v.orbit) &&
         r.pod(v.ignition_s) &&
         r.pod(v.burn_s) &&
@@ -765,7 +837,8 @@ bool read_stage2_result(CacheReader& r, falcon9::Stage2Result& v) {
         read_bool(r, v.orbit_ok) &&
         r.pod(v.tgo_final_s) &&
         r.pod(v.vgo_final_mps) &&
-        read_sim_pts(r, v.traj);
+        read_sim_pts(r, v.traj) &&
+        read_sim_pts3d(r, v.traj3d);
 }
 
 void write_recovery_result(CacheWriter& w, const falcon9::RecoveryResult& v) {
@@ -1544,12 +1617,6 @@ MissionResult solve_max_payload_request(const MissionRequest& in, std::atomic<bo
     };
 
     MissionResult plan_zero = eval_payload(0.0, 0);
-    if (!falcon9::mission_payload_search_ok(plan_zero)) {
-        plan_zero.lines.insert(plan_zero.lines.begin(), L"[Payload Capability] Max payload = N/A");
-        plan_zero.lines.insert(plan_zero.lines.begin() + 1, L"[Payload Capability] No orbit-and-landing-feasible candidate at payload = 0 kg.");
-        return plan_zero;
-    }
-
     bool have_positive_margin = payload_margin_search_ok(plan_zero);
     double best_payload_kg = 0.0;
     MissionResult best_plan = plan_zero;
@@ -1567,6 +1634,10 @@ MissionResult solve_max_payload_request(const MissionRequest& in, std::atomic<bo
             payloads.push_back(std::min(probe_payload_kg, payload_cap_kg));
             if (probe_payload_kg >= payload_cap_kg - 1e-6) break;
         }
+        if (in.payload_kg > best_payload_kg + 1e-6 && in.payload_kg <= upper_payload_kg + 1e-6) {
+            payloads.push_back(std::min(in.payload_kg, payload_cap_kg));
+        }
+        std::sort(payloads.begin(), payloads.end());
         payloads.erase(std::unique(payloads.begin(), payloads.end(), [](double a, double b) {
             return std::abs(a - b) <= 1e-6;
         }), payloads.end());
@@ -1581,6 +1652,7 @@ MissionResult solve_max_payload_request(const MissionRequest& in, std::atomic<bo
             const double probe_payload_kg = probe.payload_kg;
             const bool capped_probe = probe_payload_kg >= payload_cap_kg - 1e-6;
             if (!payload_margin_search_ok(probe.plan)) {
+                if (!have_positive_margin) continue;
                 if (!std::isfinite(local_first_fail_payload_kg)) local_first_fail_payload_kg = probe_payload_kg;
                 ++consecutive_failures;
                 if (consecutive_failures >= 3 || capped_probe) {
@@ -1601,40 +1673,34 @@ MissionResult solve_max_payload_request(const MissionRequest& in, std::atomic<bo
             }
         }
         if (hit_search_cap) break;
+        if (!have_positive_margin) break;
     }
 
-    int consecutive_final_failures = 0;
-    double local_first_final_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
-    while (!cancel_requested->load(std::memory_order_relaxed)) {
-        const double raw_probe_payload_kg = best_payload_kg + kFinalStepKg * static_cast<double>(consecutive_final_failures + 1);
-        const double probe_payload_kg = std::min(raw_probe_payload_kg, payload_cap_kg);
-        const bool capped_probe = raw_probe_payload_kg > payload_cap_kg + 1e-6;
-        MissionResult probe = eval_payload(probe_payload_kg, 0);
-        if (!payload_margin_search_ok(probe)) {
-            if (!std::isfinite(local_first_final_fail_payload_kg)) local_first_final_fail_payload_kg = probe_payload_kg;
-            ++consecutive_final_failures;
-            if (consecutive_final_failures >= 3 || capped_probe) {
-                first_fail_payload_kg = local_first_final_fail_payload_kg;
-                break;
+    if (!have_positive_margin) {
+        plan_zero.lines.insert(plan_zero.lines.begin(), L"[Payload Capability] Max payload = N/A");
+        plan_zero.lines.insert(plan_zero.lines.begin() + 1, L"[Payload Capability] No orbit-and-landing-feasible payload found in the coarse scan.");
+        plan_zero.lines.insert(plan_zero.lines.begin() + 2, L"[Payload Capability] Payload = 0 kg was not used as a hard stop; positive payloads were also checked.");
+        return plan_zero;
+    }
+
+    if (!hit_search_cap && std::isfinite(first_fail_payload_kg)) {
+        double lo = best_payload_kg;
+        double hi = std::max(first_fail_payload_kg, lo + kFinalStepKg);
+        while (!cancel_requested->load(std::memory_order_relaxed) && hi - lo > kFinalStepKg) {
+            const double probe_payload_kg = 0.5 * (lo + hi);
+            MissionResult probe = eval_payload(probe_payload_kg, 0);
+            if (payload_margin_search_ok(probe)) {
+                lo = probe_payload_kg;
+                best_payload_kg = probe_payload_kg;
+                best_plan = std::move(probe);
+            } else {
+                hi = probe_payload_kg;
+                first_fail_payload_kg = probe_payload_kg;
             }
-            continue;
-        }
-        have_positive_margin = true;
-        best_payload_kg = probe_payload_kg;
-        best_plan = std::move(probe);
-        consecutive_final_failures = 0;
-        local_first_final_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
-        if (capped_probe) {
-            hit_search_cap = true;
-            break;
         }
     }
 
-    if (!have_positive_margin && plan_zero.recovery.margin_kg <= 0.0) {
-        best_plan = plan_zero;
-        best_payload_kg = 0.0;
-        if (!std::isfinite(first_fail_payload_kg)) first_fail_payload_kg = kFinalStepKg;
-    } else if (!std::isfinite(first_fail_payload_kg)) {
+    if (!std::isfinite(first_fail_payload_kg)) {
         first_fail_payload_kg = hit_search_cap ? payload_cap_kg : best_payload_kg + kFinalStepKg;
     }
 
@@ -2344,6 +2410,42 @@ GlobeSeries profile_to_globe_series(const Series& src, const MissionResult& base
     return gs;
 }
 
+double display_rotation_angle_deg(const MissionResult& base) {
+    const double launch_lon_eci = falcon9::rad2deg(std::atan2(
+        base.orbit_target.launch_rhat_eci.y,
+        base.orbit_target.launch_rhat_eci.x));
+    return falcon9::wrap_lon_deg(launch_lon_eci - base.launch_lon_deg);
+}
+
+GlobePt globe_from_eci_r_km(const Vec3& r_km, double earth_rotation_angle_deg) {
+    const double rn = std::max(1e-9, falcon9::norm3(r_km));
+    GlobePt gp;
+    gp.lat_deg = falcon9::rad2deg(std::asin(clampd(r_km.z / rn, -1.0, 1.0)));
+    gp.lon_deg = falcon9::wrap_lon_deg(falcon9::rad2deg(std::atan2(r_km.y, r_km.x)) - earth_rotation_angle_deg);
+    gp.alt_km = std::max(0.0, rn - (falcon9::kRe / 1000.0));
+    return gp;
+}
+
+GlobePt globe_from_eci_r_m(const Vec3& r_m, double earth_rotation_angle_deg) {
+    return globe_from_eci_r_km(r_m / 1000.0, earth_rotation_angle_deg);
+}
+
+GlobeSeries traj3d_to_globe_series(
+    const std::wstring& name,
+    COLORREF color,
+    const std::vector<falcon9::SimPt3D>& traj,
+    double earth_rotation_angle_deg) {
+    GlobeSeries gs;
+    gs.name = name;
+    gs.color = color;
+    gs.pts.reserve(traj.size());
+    for (const falcon9::SimPt3D& pt : traj) {
+        GlobePt gp = globe_from_eci_r_m(pt.r_m, earth_rotation_angle_deg);
+        if (falcon9::finite_globe_pt(gp)) gs.pts.push_back(gp);
+    }
+    return gs;
+}
+
 bool stage2_insertion_display_anchor(const MissionResult& result, GlobePt& anchor, Vec3& horiz) {
     for (const GlobeSeries& series : result.globe_series) {
         if (series.name != L"Stage2 Insertion" || series.pts.size() < 2) continue;
@@ -2383,46 +2485,57 @@ void append_candidate_post_orbit_series(MissionResult& out) {
     if (!stage2.orbit_ok) return;
 
     GlobePt insertion_gp{};
-    falcon9::destination_from_course(
-        out.launch_lat_deg,
-        out.launch_lon_deg,
-        out.orbit_target.launch_az_deg,
-        std::max(0.0, stage2.seco.theta * (falcon9::kRe / 1000.0)),
-        insertion_gp.lat_deg,
-        insertion_gp.lon_deg);
-    insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - falcon9::kRe) / 1000.0);
+    Vec3 r_vec{};
+    Vec3 v_vec{};
+    const bool use_state3d = stage2.seco3d.valid;
+    const double earth_rotation_angle_deg = display_rotation_angle_deg(out);
+    if (use_state3d) {
+        insertion_gp = globe_from_eci_r_m(stage2.seco3d.r_m, earth_rotation_angle_deg);
+        r_vec = stage2.seco3d.r_m / 1000.0;
+        v_vec = stage2.seco3d.v_mps / 1000.0;
+    } else {
+        falcon9::destination_from_course(
+            out.launch_lat_deg,
+            out.launch_lon_deg,
+            out.orbit_target.launch_az_deg,
+            std::max(0.0, stage2.seco.theta * (falcon9::kRe / 1000.0)),
+            insertion_gp.lat_deg,
+            insertion_gp.lon_deg);
+        insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - falcon9::kRe) / 1000.0);
 
-    Vec3 horiz{};
-    if (!stage2_insertion_display_anchor(out, insertion_gp, horiz)) {
-        const Vec3 east = falcon9::normalize3({-std::sin(deg2rad(insertion_gp.lon_deg)), std::cos(deg2rad(insertion_gp.lon_deg)), 0.0});
-        const Vec3 north = falcon9::normalize3({
-            -std::sin(deg2rad(insertion_gp.lat_deg)) * std::cos(deg2rad(insertion_gp.lon_deg)),
-            -std::sin(deg2rad(insertion_gp.lat_deg)) * std::sin(deg2rad(insertion_gp.lon_deg)),
-            std::cos(deg2rad(insertion_gp.lat_deg))});
-        const double az_rad = deg2rad(out.orbit_target.launch_az_deg);
-        horiz = falcon9::normalize3({
-            north.x * std::cos(az_rad) + east.x * std::sin(az_rad),
-            north.y * std::cos(az_rad) + east.y * std::sin(az_rad),
-            north.z * std::cos(az_rad) + east.z * std::sin(az_rad),
+        Vec3 horiz{};
+        if (!stage2_insertion_display_anchor(out, insertion_gp, horiz)) {
+            const Vec3 east = falcon9::normalize3({-std::sin(deg2rad(insertion_gp.lon_deg)), std::cos(deg2rad(insertion_gp.lon_deg)), 0.0});
+            const Vec3 north = falcon9::normalize3({
+                -std::sin(deg2rad(insertion_gp.lat_deg)) * std::cos(deg2rad(insertion_gp.lon_deg)),
+                -std::sin(deg2rad(insertion_gp.lat_deg)) * std::sin(deg2rad(insertion_gp.lon_deg)),
+                std::cos(deg2rad(insertion_gp.lat_deg))});
+            const double az_rad = deg2rad(out.orbit_target.launch_az_deg);
+            horiz = falcon9::normalize3({
+                north.x * std::cos(az_rad) + east.x * std::sin(az_rad),
+                north.y * std::cos(az_rad) + east.y * std::sin(az_rad),
+                north.z * std::cos(az_rad) + east.z * std::sin(az_rad),
+            });
+        }
+        insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - falcon9::kRe) / 1000.0);
+        const Vec3 rhat = falcon9::normalize3(falcon9::ecef_from_geo(insertion_gp.lat_deg, insertion_gp.lon_deg, 0.0));
+        const double fpa_rad = deg2rad(stage2.orbit.flight_path_deg);
+        const Vec3 vdir = falcon9::normalize3({
+            horiz.x * std::cos(fpa_rad) + rhat.x * std::sin(fpa_rad),
+            horiz.y * std::cos(fpa_rad) + rhat.y * std::sin(fpa_rad),
+            horiz.z * std::cos(fpa_rad) + rhat.z * std::sin(fpa_rad),
         });
-    }
-    insertion_gp.alt_km = std::max(0.0, (stage2.seco.r - falcon9::kRe) / 1000.0);
-    const Vec3 rhat = falcon9::normalize3(falcon9::ecef_from_geo(insertion_gp.lat_deg, insertion_gp.lon_deg, 0.0));
-    const double fpa_rad = deg2rad(stage2.orbit.flight_path_deg);
-    const Vec3 vdir = falcon9::normalize3({
-        horiz.x * std::cos(fpa_rad) + rhat.x * std::sin(fpa_rad),
-        horiz.y * std::cos(fpa_rad) + rhat.y * std::sin(fpa_rad),
-        horiz.z * std::cos(fpa_rad) + rhat.z * std::sin(fpa_rad),
-    });
 
-    const double rmag_km = stage2.seco.r / 1000.0;
-    const double speed_kmps = stage2.orbit.speed_mps / 1000.0;
-    const Vec3 r_vec{rmag_km * rhat.x, rmag_km * rhat.y, rmag_km * rhat.z};
-    const Vec3 v_vec{speed_kmps * vdir.x, speed_kmps * vdir.y, speed_kmps * vdir.z};
+        const double rmag_km = stage2.seco.r / 1000.0;
+        const double speed_kmps = stage2.orbit.speed_mps / 1000.0;
+        r_vec = {rmag_km * rhat.x, rmag_km * rhat.y, rmag_km * rhat.z};
+        v_vec = {speed_kmps * vdir.x, speed_kmps * vdir.y, speed_kmps * vdir.z};
+    }
     const Vec3 h_vec = falcon9::cross3(r_vec, v_vec);
     const double h_norm = std::sqrt(falcon9::dot3(h_vec, h_vec));
     if (h_norm <= 1e-8) return;
 
+    const double rmag_km = std::max(1e-9, falcon9::norm3(r_vec));
     const Vec3 h_hat = falcon9::normalize3(h_vec);
     const Vec3 e_vec = {
         (v_vec.y * h_vec.z - v_vec.z * h_vec.y) / falcon9::kMuKm - r_vec.x / std::max(1e-9, rmag_km),
@@ -2458,9 +2571,13 @@ void append_candidate_post_orbit_series(MissionResult& out) {
         };
         const double qn = std::sqrt(falcon9::dot3(q, q));
         GlobePt gp{};
-        gp.lat_deg = falcon9::rad2deg(std::asin(clampd(q.z / std::max(1e-9, qn), -1.0, 1.0)));
-        gp.lon_deg = wrap_lon_deg(falcon9::rad2deg(std::atan2(q.y, q.x)));
-        gp.alt_km = std::max(0.0, qn - (falcon9::kRe / 1000.0));
+        if (use_state3d) {
+            gp = globe_from_eci_r_km(q, earth_rotation_angle_deg);
+        } else {
+            gp.lat_deg = falcon9::rad2deg(std::asin(clampd(q.z / std::max(1e-9, qn), -1.0, 1.0)));
+            gp.lon_deg = wrap_lon_deg(falcon9::rad2deg(std::atan2(q.y, q.x)));
+            gp.alt_km = std::max(0.0, qn - (falcon9::kRe / 1000.0));
+        }
         post_orbit.pts.push_back(gp);
     }
     out.globe_series.push_back(std::move(post_orbit));
@@ -2475,6 +2592,11 @@ MissionResult build_candidate_display_plan(const App& a) {
     out.launch_lat_deg = a.plan.launch_lat_deg;
     out.launch_lon_deg = a.plan.launch_lon_deg;
     out.launch_epoch_utc_jd = a.plan.launch_epoch_utc_jd;
+    out.lvd_launch_offset_s = a.plan.lvd_launch_offset_s;
+    out.lvd_earth_rotation_angle_deg = a.plan.lvd_earth_rotation_angle_deg;
+    out.lvd_launch_raan_deg = a.plan.lvd_launch_raan_deg;
+    out.lvd_target_raan_deg = a.plan.lvd_target_raan_deg;
+    out.lvd_plane_error_deg = a.plan.lvd_plane_error_deg;
     out.ship_lat_deg = a.plan.ship_lat_deg;
     out.ship_lon_deg = a.plan.ship_lon_deg;
     out.view_lat_deg = a.plan.view_lat_deg;
@@ -2520,7 +2642,14 @@ MissionResult build_candidate_display_plan(const App& a) {
     out.profile_series.push_back(std::move(insertion));
 
     for (const Series& series : out.profile_series) {
-        out.globe_series.push_back(profile_to_globe_series(series, out));
+        const double earth_rotation_angle_deg = display_rotation_angle_deg(out);
+        if (series.name == L"Stage1 LVD Ascent" && !out.stage1.traj3d.empty()) {
+            out.globe_series.push_back(traj3d_to_globe_series(series.name, series.color, out.stage1.traj3d, earth_rotation_angle_deg));
+        } else if (series.name == L"Stage2 Insertion" && !out.stage2.traj3d.empty()) {
+            out.globe_series.push_back(traj3d_to_globe_series(series.name, series.color, out.stage2.traj3d, earth_rotation_angle_deg));
+        } else {
+            out.globe_series.push_back(profile_to_globe_series(series, out));
+        }
     }
     append_candidate_post_orbit_series(out);
     return out;

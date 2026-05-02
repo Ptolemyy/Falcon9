@@ -141,8 +141,53 @@ struct Vec3 {
     double z = 0.0;
 };
 
+inline Vec3 operator+(const Vec3& a, const Vec3& b) {
+    return {a.x + b.x, a.y + b.y, a.z + b.z};
+}
+
+inline Vec3 operator-(const Vec3& a, const Vec3& b) {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+inline Vec3 operator*(const Vec3& v, double s) {
+    return {v.x * s, v.y * s, v.z * s};
+}
+
+inline Vec3 operator*(double s, const Vec3& v) {
+    return v * s;
+}
+
+inline Vec3 operator/(const Vec3& v, double s) {
+    return {v.x / s, v.y / s, v.z / s};
+}
+
+inline Vec3& operator+=(Vec3& a, const Vec3& b) {
+    a.x += b.x;
+    a.y += b.y;
+    a.z += b.z;
+    return a;
+}
+
+inline Vec3& operator-=(Vec3& a, const Vec3& b) {
+    a.x -= b.x;
+    a.y -= b.y;
+    a.z -= b.z;
+    return a;
+}
+
+inline Vec3& operator*=(Vec3& v, double s) {
+    v.x *= s;
+    v.y *= s;
+    v.z *= s;
+    return v;
+}
+
 inline double dot3(const Vec3& a, const Vec3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+inline double norm3(const Vec3& v) {
+    return std::sqrt(dot3(v, v));
 }
 
 inline Vec3 cross3(const Vec3& a, const Vec3& b) {
@@ -154,9 +199,13 @@ inline Vec3 cross3(const Vec3& a, const Vec3& b) {
 }
 
 inline Vec3 normalize3(const Vec3& v) {
-    const double n = std::sqrt(dot3(v, v));
+    const double n = norm3(v);
     if (n <= 1e-12) return {0.0, 0.0, 0.0};
     return {v.x / n, v.y / n, v.z / n};
+}
+
+inline Vec3 reject3(const Vec3& v, const Vec3& n_hat) {
+    return v - n_hat * dot3(v, n_hat);
 }
 
 inline Vec3 ecef_from_geo(double lat_deg, double lon_deg, double alt_km) {
@@ -170,6 +219,133 @@ inline Vec3 ecef_from_geo(double lat_deg, double lon_deg, double alt_km) {
         r * std::sin(lat),
     };
 }
+
+struct Quat {
+    double w = 1.0;
+    double x = 0.0;
+    double y = 0.0;
+    double z = 0.0;
+};
+
+inline Quat normalize_quat(const Quat& q) {
+    const double n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
+    if (n <= 1e-12) return {};
+    return {q.w / n, q.x / n, q.y / n, q.z / n};
+}
+
+inline Quat slerp_quat(Quat a, Quat b, double u) {
+    a = normalize_quat(a);
+    b = normalize_quat(b);
+    double d = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+    if (d < 0.0) {
+        d = -d;
+        b = {-b.w, -b.x, -b.y, -b.z};
+    }
+    u = clampd(u, 0.0, 1.0);
+    if (d > 0.9995) {
+        return normalize_quat({
+            lerpd(a.w, b.w, u),
+            lerpd(a.x, b.x, u),
+            lerpd(a.y, b.y, u),
+            lerpd(a.z, b.z, u),
+        });
+    }
+    const double theta0 = std::acos(clampd(d, -1.0, 1.0));
+    const double theta = theta0 * u;
+    const double s0 = std::cos(theta) - d * std::sin(theta) / std::max(1e-12, std::sin(theta0));
+    const double s1 = std::sin(theta) / std::max(1e-12, std::sin(theta0));
+    return normalize_quat({
+        s0 * a.w + s1 * b.w,
+        s0 * a.x + s1 * b.x,
+        s0 * a.y + s1 * b.y,
+        s0 * a.z + s1 * b.z,
+    });
+}
+
+inline Vec3 rotate_quat(const Quat& q_in, const Vec3& v) {
+    const Quat q = normalize_quat(q_in);
+    const Vec3 u{q.x, q.y, q.z};
+    const Vec3 uv = cross3(u, v);
+    const Vec3 uuv = cross3(u, uv);
+    return v + (uv * (2.0 * q.w)) + (uuv * 2.0);
+}
+
+struct StateVector3D {
+    Vec3 r_m{kRe, 0.0, 0.0};
+    Vec3 v_mps{0.0, 0.0, 0.0};
+    double m_kg = 0.0;
+    bool valid = false;
+};
+
+struct SimPt3D {
+    double t = 0.0;
+    Vec3 r_m{kRe, 0.0, 0.0};
+    Vec3 v_mps{0.0, 0.0, 0.0};
+};
+
+struct RpyCommand {
+    double roll_rad = 0.0;
+    double pitch_rad = 0.0;
+    double yaw_rad = 0.0;
+};
+
+struct CubicPoly {
+    double c0 = 0.0;
+    double c1 = 0.0;
+    double c2 = 0.0;
+    double c3 = 0.0;
+
+    double value(double t_s) const {
+        return ((c3 * t_s + c2) * t_s + c1) * t_s + c0;
+    }
+};
+
+struct RpyTablePoint {
+    double t_s = 0.0;
+    RpyCommand rpy;
+};
+
+struct QuatTablePoint {
+    double t_s = 0.0;
+    Quat q;
+};
+
+enum class SteeringModelType {
+    GuidanceRpy,
+    RpyPolynomial,
+    RpyTable,
+    QuaternionTable,
+};
+
+struct SteeringModel3D {
+    SteeringModelType type = SteeringModelType::GuidanceRpy;
+    CubicPoly roll_poly;
+    CubicPoly pitch_poly;
+    CubicPoly yaw_poly;
+    std::vector<RpyTablePoint> rpy_table;
+    std::vector<QuatTablePoint> quat_table;
+    double model_blend = 1.0;
+};
+
+struct ThrottleTablePoint {
+    double t_s = 0.0;
+    double throttle = 1.0;
+};
+
+enum class ThrottleModelType {
+    Guidance,
+    Constant,
+    Polynomial,
+    Table,
+};
+
+struct ThrottleModel {
+    ThrottleModelType type = ThrottleModelType::Guidance;
+    double constant = 1.0;
+    CubicPoly polynomial;
+    std::vector<ThrottleTablePoint> table;
+    double model_blend = 1.0;
+};
 
 struct MissionRequest {
     double payload_kg = 15000.0;
@@ -258,11 +434,19 @@ struct OrbitTarget {
     double vt_target_mps = 0.0;
     double speed_target_mps = 0.0;
     double fpa_target_deg = 0.0;
+    Vec3 launch_rhat_eci{1.0, 0.0, 0.0};
+    Vec3 launch_east_eci{0.0, 1.0, 0.0};
+    Vec3 launch_north_eci{0.0, 0.0, 1.0};
+    Vec3 launch_tangent_eci{0.0, 1.0, 0.0};
+    Vec3 plane_normal_eci{0.0, 0.0, 1.0};
+    bool has_3d_plane = false;
 };
 
 struct Stage1Result {
     PolarState meco;
     PolarState sep;
+    StateVector3D meco3d;
+    StateVector3D sep3d;
     double burn_s = 0.0;
     double meco_s = 0.0;
     double sep_s = 0.0;
@@ -281,11 +465,14 @@ struct Stage1Result {
     double tgo_final_s = 0.0;
     double vgo_final_mps = 0.0;
     std::vector<SimPt> traj;
+    std::vector<SimPt3D> traj3d;
 };
 
 struct Stage2Result {
     PolarState ignition;
     PolarState seco;
+    StateVector3D ignition3d;
+    StateVector3D seco3d;
     OrbitMetrics orbit;
     double ignition_s = 0.0;
     double burn_s = 0.0;
@@ -303,6 +490,7 @@ struct Stage2Result {
     double tgo_final_s = 0.0;
     double vgo_final_mps = 0.0;
     std::vector<SimPt> traj;
+    std::vector<SimPt3D> traj3d;
 };
 
 struct RecoveryResult {
@@ -344,6 +532,7 @@ struct LaunchWindowSample {
 struct LvdStateSample {
     double t_s = 0.0;
     PolarState state;
+    StateVector3D state3d;
     double q_kpa = 0.0;
     double throttle = 0.0;
 };
@@ -407,6 +596,7 @@ struct SolveControl {
 };
 
 OrbitMetrics orbit_metrics_from_state(const PolarState& s);
+OrbitMetrics orbit_metrics_from_state3d(const StateVector3D& s);
 OrbitTarget build_orbit_target(const MissionRequest& request);
 MissionRequest sanitize_request(const MissionRequest& request);
 MissionResult solve_mission(const MissionRequest& request, SolveControl control = {});

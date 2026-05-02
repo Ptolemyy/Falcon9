@@ -23,7 +23,7 @@ Vehicle/stage/payload/launch parameters are loaded from `send.txt` config.
 - Stage-1 LVD is solved once per payload with a mission-scored direct search over SEP targets plus steering/throttle node parameters, then separation time is searched by clipping the LVD reference trajectory
 - Droneship downrange is set to Stage-1 ballistic impact prediction (with atmospheric drag)
 - Stage-1 ascent uses a C++ LVD-style event model with launch-window/planet-rotation inputs
-- Stage-2 orbit insertion uses propagated UPFG-like guidance instead of a Bezier approximation
+- Stage-2 orbit insertion uses propagated 3D UPFG/PEG explicit guidance with thrust integrals instead of a Bezier approximation
 - Single-window DISPLAY view:
   - Blue Marble Earth texture with atmosphere-style rim
   - Mission trajectories projected around Earth

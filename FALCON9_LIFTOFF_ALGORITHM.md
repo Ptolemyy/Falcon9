@@ -4,14 +4,14 @@
 
 This document describes the ascent algorithm now intended for the planner.
 
-It does **not** aim to be a mathematically pure UPFG implementation.
-Instead, it aims to imitate the structure of a Falcon 9-style ascent program while still keeping a terminal-state correction layer so the planner can:
+Stage 1 does **not** aim to be a mathematically pure UPFG implementation.
+Instead, stage 1 imitates the structure of a Falcon 9-style ascent program while still keeping a terminal-state correction layer so the planner can:
 
 1. maximize insertion mass,
 2. keep stage-1 recovery feasible,
 3. maintain acceptable stage-separation conditions for stage 2.
 
-The algorithm is designed for the current 2D planner, but the structure is also suitable as a later bridge toward a higher-fidelity guidance implementation.
+Stage 1 is now propagated in 3D, while the stage-2 insertion solver uses a 3D UPFG/PEG powered explicit guidance law with thrust integrals.
 
 ## Design Principles
 
@@ -37,24 +37,22 @@ The ascent is split into these phases:
 
 ## State And Controls
 
-The planner remains in 2D:
+Stage-1 ascent is propagated as a 3D inertial state:
 
 ```text
-state = [x, z, vx, vz, m]
+state = [r_eci, v_eci, m]
 ```
 
 Where:
 
-1. `x`: downrange distance
-2. `z`: altitude
-3. `vx`: horizontal velocity
-4. `vz`: vertical velocity
-5. `m`: total vehicle mass
+1. `r_eci`: inertial position vector
+2. `v_eci`: inertial velocity vector
+3. `m`: total vehicle mass
 
 Control variables:
 
 1. throttle command
-2. pitch command
+2. roll/pitch/yaw steering command in the local radial/tangential/crossrange frame
 
 ## Core Guidance Logic
 
@@ -206,9 +204,9 @@ The current implementation in this repository follows this practical sequence:
 2. Stage 1 starts from site latitude and includes the rotational velocity component available for the requested inclination.
 3. Early ascent uses a time/altitude pitch backbone with an explicit Max-Q throttle bucket.
 4. Normal recoverable missions cap usable stage-1 propellant by the configured stage-1 reserve ratio. The cap is bypassed only for explicit burnout / no-recovery modes.
-5. Late stage-1 ascent uses a terminal correction layer toward separation altitude, speed, and flight-path angle. This layer is deliberately not a full stage-1 UPFG handoff because preserving recovery margin and avoiding overly lofted separation are more important in the current 2D planner.
+5. Late stage-1 ascent uses a terminal correction layer toward separation altitude, speed, and flight-path angle. This layer is deliberately not a full stage-1 UPFG handoff because preserving recovery margin and avoiding overly lofted separation are more important for the booster phase.
 6. Every candidate stage-1 separation is propagated through the real stage-2 solver before ranking. A separation that looks good by altitude/speed alone is not accepted if stage 2 cannot insert accurately.
-7. Stage 2 uses blended terminal UPFG guidance, adaptive terminal step size, and a continuous orbit-error penalty. The stage-1 search therefore sees actual insertion miss distance instead of an idealized delta-v estimate.
+7. Stage 2 uses a 3D UPFG/PEG powered explicit guidance law. The guidance computes `J/S/Q` thrust integrals from current mass, thrust, and Isp, solves explicit `tgo`, `lambda0`, and `lambda1` steering terms from terminal velocity plus radial/cross-plane position constraints, then propagates `normalize(lambda0 + lambda1 * tau)` as the thrust direction and evaluates continuous orbit-error penalty.
 8. Separation-time samples can be evaluated in parallel. Max-payload mode also uses a parallel coarse payload sweep before the final fine search.
 9. Candidate ranking prefers feasible orbit insertion and recovery first, then uses remaining stage-2 propellant, stage-1 reserve, Max-Q excess, and separation-state error as secondary terms.
 
@@ -218,7 +216,7 @@ In short, the liftoff algorithm is now a coupled mission planner:
 UTC / target orbit
   -> stage-1 pitch + throttle candidate
   -> separation state
-  -> propagated stage-2 UPFG insertion
+  -> propagated stage-2 UPFG/PEG insertion
   -> propagated stage-1 recovery
   -> candidate ranking
 ```
@@ -229,7 +227,7 @@ This is intentionally more conservative than a pure single-stage guidance law, b
 
 This ascent law is not:
 
-1. a strict textbook UPFG implementation,
+1. a strict textbook UPFG implementation for the first-stage booster,
 2. a hard-coded copy of one Falcon 9 mission timeline,
 3. a pure heuristic pitch table with no terminal feedback.
 
@@ -249,7 +247,7 @@ In the current planner, the intended implementation behavior is:
 3. terminal correction shapes separation state late,
 4. stage-separation flight-path angle is actively driven downward to avoid an overly lofted stage-2 injection,
 5. stage-2 insertion is propagated and fed back into stage-1 burn search,
-6. stage-2 UPFG is used as a terminal insertion correction rather than a replacement for the whole ascent profile,
+6. stage-2 uses the UPFG/PEG powered explicit insertion law as the orbital insertion solver after separation,
 7. max-payload mode prioritizes reducing unnecessary stage-1 reserve,
 8. launch-window calculations are UTC-driven when a UTC epoch is provided in the vehicle configuration.
 

@@ -12,11 +12,15 @@ namespace {
 constexpr double kAcceptedMissionScoreCutoff = 1.0e8;
 
 struct FlatState {
-    double x = 0.0;
-    double z = 0.0;
-    double vx = 0.0;
-    double vz = 0.0;
+    Vec3 r{kRe, 0.0, 0.0};
+    Vec3 v{0.0, 0.0, 0.0};
     double m = 0.0;
+};
+
+struct LocalFrame3D {
+    Vec3 rhat{1.0, 0.0, 0.0};
+    Vec3 that{0.0, 1.0, 0.0};
+    Vec3 chat{0.0, 0.0, 1.0};
 };
 
 struct LvdDesign {
@@ -46,6 +50,7 @@ struct LvdSample {
     double q_kpa = 0.0;
     double throttle = 0.0;
     double mass_kg = 0.0;
+    StateVector3D state3d;
 };
 
 struct CandidateSim {
@@ -155,17 +160,157 @@ double initial_downrange_velocity(const MissionRequest& request, const OrbitTarg
     return kOmega * kRe * std::cos(lat) * std::sin(az);
 }
 
-void push_sample(std::vector<LvdSample>& samples, const FlatState& s, double t, double q_kpa, double throttle) {
-    const double speed = std::hypot(s.vx, s.vz);
+Vec3 atmosphere_velocity_eci(const Vec3& r) {
+    return cross3({0.0, 0.0, kOmega}, r);
+}
+
+LocalFrame3D local_frame(const FlatState& s, const OrbitTarget& orbit_target) {
+    LocalFrame3D out;
+    out.rhat = normalize3(s.r);
+    const Vec3 n_hat = normalize3(orbit_target.plane_normal_eci);
+    out.that = normalize3(cross3(n_hat, out.rhat));
+    if (dot3(out.that, orbit_target.launch_tangent_eci) < 0.0) out.that *= -1.0;
+    if (dot3(out.that, out.that) < 1e-10) {
+        out.that = normalize3(reject3(orbit_target.launch_tangent_eci, out.rhat));
+    }
+    out.chat = normalize3(cross3(out.rhat, out.that));
+    return out;
+}
+
+double altitude_m(const FlatState& s) {
+    return norm3(s.r) - kRe;
+}
+
+double downrange_m(const FlatState& s, const OrbitTarget& orbit_target) {
+    const Vec3 rhat = normalize3(s.r);
+    const double along = dot3(rhat, orbit_target.launch_tangent_eci);
+    const double radial = dot3(rhat, orbit_target.launch_rhat_eci);
+    return kRe * std::atan2(along, radial);
+}
+
+PolarState polar_from_state3d(const FlatState& s, const OrbitTarget& orbit_target) {
+    const LocalFrame3D frame = local_frame(s, orbit_target);
+    const double r = norm3(s.r);
+    const double vr = dot3(s.v, frame.rhat);
+    const double vt = dot3(s.v, frame.that);
+    return {r, downrange_m(s, orbit_target) / kRe, vr, vt, s.m};
+}
+
+Vec3 thrust_dir_from_rpy(const RpyCommand& cmd, const LocalFrame3D& frame) {
+    const double cp = std::cos(cmd.pitch_rad);
+    const double sp = std::sin(cmd.pitch_rad);
+    const double cy = std::cos(cmd.yaw_rad);
+    const double sy = std::sin(cmd.yaw_rad);
+    return normalize3(frame.that * (cp * cy) + frame.chat * (cp * sy) + frame.rhat * sp);
+}
+
+RpyCommand interpolate_rpy_table(const std::vector<RpyTablePoint>& table, double t_s, const RpyCommand& fallback) {
+    if (table.empty()) return fallback;
+    if (t_s <= table.front().t_s) return table.front().rpy;
+    if (t_s >= table.back().t_s) return table.back().rpy;
+    for (size_t i = 1; i < table.size(); ++i) {
+        if (table[i].t_s < t_s) continue;
+        const RpyTablePoint& a = table[i - 1];
+        const RpyTablePoint& b = table[i];
+        const double u = clampd((t_s - a.t_s) / std::max(1e-9, b.t_s - a.t_s), 0.0, 1.0);
+        return {
+            lerpd(a.rpy.roll_rad, b.rpy.roll_rad, u),
+            lerpd(a.rpy.pitch_rad, b.rpy.pitch_rad, u),
+            lerpd(a.rpy.yaw_rad, b.rpy.yaw_rad, u),
+        };
+    }
+    return fallback;
+}
+
+Quat interpolate_quat_table(const std::vector<QuatTablePoint>& table, double t_s) {
+    if (table.empty()) return {};
+    if (t_s <= table.front().t_s) return table.front().q;
+    if (t_s >= table.back().t_s) return table.back().q;
+    for (size_t i = 1; i < table.size(); ++i) {
+        if (table[i].t_s < t_s) continue;
+        const QuatTablePoint& a = table[i - 1];
+        const QuatTablePoint& b = table[i];
+        const double u = clampd((t_s - a.t_s) / std::max(1e-9, b.t_s - a.t_s), 0.0, 1.0);
+        return slerp_quat(a.q, b.q, u);
+    }
+    return table.back().q;
+}
+
+RpyCommand evaluate_steering_model(const SteeringModel3D& model, double t_s, const RpyCommand& guidance) {
+    RpyCommand model_cmd = guidance;
+    switch (model.type) {
+        case SteeringModelType::GuidanceRpy:
+            return guidance;
+        case SteeringModelType::RpyPolynomial:
+            model_cmd = {
+                model.roll_poly.value(t_s),
+                model.pitch_poly.value(t_s),
+                model.yaw_poly.value(t_s),
+            };
+            break;
+        case SteeringModelType::RpyTable:
+            model_cmd = interpolate_rpy_table(model.rpy_table, t_s, guidance);
+            break;
+        case SteeringModelType::QuaternionTable:
+            return guidance;
+    }
+    const double u = clampd(model.model_blend, 0.0, 1.0);
+    return {
+        lerpd(guidance.roll_rad, model_cmd.roll_rad, u),
+        lerpd(guidance.pitch_rad, model_cmd.pitch_rad, u),
+        lerpd(guidance.yaw_rad, model_cmd.yaw_rad, u),
+    };
+}
+
+double interpolate_throttle_table(const std::vector<ThrottleTablePoint>& table, double t_s, double fallback) {
+    if (table.empty()) return fallback;
+    if (t_s <= table.front().t_s) return table.front().throttle;
+    if (t_s >= table.back().t_s) return table.back().throttle;
+    for (size_t i = 1; i < table.size(); ++i) {
+        if (table[i].t_s < t_s) continue;
+        const ThrottleTablePoint& a = table[i - 1];
+        const ThrottleTablePoint& b = table[i];
+        const double u = clampd((t_s - a.t_s) / std::max(1e-9, b.t_s - a.t_s), 0.0, 1.0);
+        return lerpd(a.throttle, b.throttle, u);
+    }
+    return fallback;
+}
+
+double evaluate_throttle_model(const ThrottleModel& model, double t_s, double guidance) {
+    double model_cmd = guidance;
+    switch (model.type) {
+        case ThrottleModelType::Guidance:
+            return guidance;
+        case ThrottleModelType::Constant:
+            model_cmd = model.constant;
+            break;
+        case ThrottleModelType::Polynomial:
+            model_cmd = model.polynomial.value(t_s);
+            break;
+        case ThrottleModelType::Table:
+            model_cmd = interpolate_throttle_table(model.table, t_s, guidance);
+            break;
+    }
+    return clampd(lerpd(guidance, model_cmd, clampd(model.model_blend, 0.0, 1.0)), 0.0, 1.0);
+}
+
+void push_sample(std::vector<LvdSample>& samples, const FlatState& s, const OrbitTarget& orbit_target, double t, double q_kpa, double throttle) {
+    const LocalFrame3D frame = local_frame(s, orbit_target);
+    const double r = norm3(s.r);
+    const double alt = std::max(0.0, r - kRe);
+    const double vr = dot3(s.v, frame.rhat);
+    const double horizontal_speed = norm3(s.v - frame.rhat * vr);
+    const double speed = norm3(s.v);
     samples.push_back({
         t,
-        s.x / 1000.0,
-        std::max(0.0, s.z / 1000.0),
+        downrange_m(s, orbit_target) / 1000.0,
+        alt / 1000.0,
         speed,
-        rad2deg(std::atan2(s.vz, std::max(1.0, s.vx))),
+        rad2deg(std::atan2(vr, std::max(1.0, horizontal_speed))),
         q_kpa,
         throttle,
         s.m,
+        {s.r, s.v, s.m, true},
     });
 }
 
@@ -222,6 +367,7 @@ std::vector<LvdStateSample> build_state_samples(const std::vector<LvdSample>& sa
         sample.state.vr = s.speed_mps * std::sin(gamma);
         sample.state.vt = s.speed_mps * std::cos(gamma);
         sample.state.m = s.mass_kg;
+        sample.state3d = s.state3d;
         sample.q_kpa = s.q_kpa;
         sample.throttle = s.throttle;
         out.push_back(sample);
@@ -347,9 +493,10 @@ CandidateSim simulate_lvd_design(
     out.design = design;
 
     FlatState s;
-    s.vx = initial_downrange_velocity(request, orbit_target);
+    s.r = orbit_target.launch_rhat_eci * kRe;
+    s.v = atmosphere_velocity_eci(s.r);
     s.m = request.s1_dry_kg + request.s1_prop_kg + request.s2_dry_kg + request.s2_prop_kg + request.payload_kg;
-    const double atmosphere_vx = s.vx;
+    const Vec3 plane_normal = normalize3(orbit_target.plane_normal_eci);
 
     const double thrust = request.s1_thrust_kN * 1000.0;
     const double mdot_nom = thrust / std::max(1e-6, request.s1_isp_s * kG0);
@@ -378,23 +525,26 @@ CandidateSim simulate_lvd_design(
     out.stage1.guide_start_s = guide_start_s;
     out.stage1.min_throttle = 1.0;
     out.stage1.traj.reserve(360);
+    out.stage1.traj3d.reserve(360);
     out.samples.reserve(360);
     out.stage1.traj.push_back({0.0, 0.0, 0.0});
-    push_sample(out.samples, s, 0.0, 0.0, 1.0);
+    out.stage1.traj3d.push_back({0.0, s.r, s.v});
+    push_sample(out.samples, s, orbit_target, 0.0, 0.0, 1.0);
 
     double t = 0.0;
     double used = 0.0;
     double pitch_cmd = deg2rad(89.2);
+    double yaw_cmd = 0.0;
     double last_q_kpa = 0.0;
     double last_throttle = 1.0;
 
     while (t < burn_s - 1e-9 && used < s1_max_consumable_kg - 1e-9) {
         const double dt = std::min(dt_guidance, burn_s - t);
-        const double alt_m = std::max(0.0, s.z);
-        const double speed = std::hypot(s.vx, s.vz);
-        const double air_vx = s.vx - atmosphere_vx;
-        const double air_vz = s.vz;
-        const double air_speed = std::hypot(air_vx, air_vz);
+        const LocalFrame3D frame = local_frame(s, orbit_target);
+        const double alt_m = std::max(0.0, altitude_m(s));
+        const double speed = norm3(s.v);
+        const Vec3 air_v = s.v - atmosphere_velocity_eci(s.r);
+        const double air_speed = norm3(air_v);
         const double dens = rho(alt_m);
         const double q_kpa = 0.5 * dens * air_speed * air_speed / 1000.0;
         last_q_kpa = q_kpa;
@@ -403,30 +553,40 @@ CandidateSim simulate_lvd_design(
             out.stage1.t_max_q = t;
         }
 
-        const double g = grav(alt_m);
+        const double r_norm = std::max(1.0, norm3(s.r));
+        const Vec3 gravity = s.r * (-kMu / (r_norm * r_norm * r_norm));
         const double drag = 0.5 * dens * air_speed * air_speed * cda;
-        double drag_ax = 0.0;
-        double drag_az = 0.0;
+        Vec3 drag_acc{0.0, 0.0, 0.0};
         if (air_speed > 1e-6) {
             const double invm = 1.0 / std::max(1.0, s.m);
-            drag_ax = (drag * invm) * (air_vx / air_speed);
-            drag_az = (drag * invm) * (air_vz / air_speed);
+            drag_acc = air_v * ((drag * invm) / air_speed);
         }
 
+        const double vr = dot3(s.v, frame.rhat);
+        const double vt = dot3(s.v, frame.that);
+        const double cross_pos = dot3(s.r, plane_normal);
+        const double cross_vel = dot3(s.v, plane_normal);
         const double tgo = clampd(burn_s - t, 4.0, 120.0);
-        const double ax_need = clampd(design.terminal_gain_scale * (sep_target_vx - s.vx) / tgo, -30.0, 35.0);
+        const double ax_need = clampd(design.terminal_gain_scale * (sep_target_vx - vt) / tgo, -30.0, 35.0);
         const double az_need = clampd(
-            design.terminal_gain_scale * ((meco_target_vz - s.vz) / tgo +
-                2.0 * (meco_target_z - s.z - s.vz * tgo) / std::max(1.0, tgo * tgo)),
+            design.terminal_gain_scale * ((meco_target_vz - vr) / tgo +
+                2.0 * (meco_target_z - alt_m - vr * tgo) / std::max(1.0, tgo * tgo)),
             -30.0,
             38.0);
-        double thrust_ax_cmd = ax_need + drag_ax;
-        double thrust_az_cmd = az_need + g + drag_az;
+        const double ac_need = clampd(
+            design.terminal_gain_scale * (-0.85 * cross_vel / tgo - 1.30 * cross_pos / std::max(1.0, tgo * tgo)),
+            -8.0,
+            8.0);
+        double thrust_ax_cmd = ax_need + dot3(drag_acc, frame.that);
+        double thrust_az_cmd = az_need - dot3(gravity, frame.rhat) + dot3(drag_acc, frame.rhat);
+        double thrust_ac_cmd = ac_need + dot3(drag_acc, plane_normal);
         thrust_ax_cmd = std::max(1e-4, thrust_ax_cmd);
         thrust_az_cmd = std::max(0.0, thrust_az_cmd);
         double pitch_raw = std::atan2(thrust_az_cmd, thrust_ax_cmd);
+        double yaw_raw = std::atan2(thrust_ac_cmd, std::max(1e-4, std::hypot(thrust_ax_cmd, thrust_az_cmd)));
         const double vertical_hold = 1.0 - smoothstep(6.0, 22.0, t);
         pitch_raw = lerpd(pitch_raw, deg2rad(89.2), vertical_hold);
+        yaw_raw = lerpd(yaw_raw, 0.0, vertical_hold);
         const double burn_u = clampd(t / std::max(1.0, burn_s), 0.0, 1.0);
         const double pitch_bias_deg = interp3(
             burn_u,
@@ -457,6 +617,7 @@ CandidateSim simulate_lvd_design(
         const double pitch_min_deg =
             ((payload_shape > 0.45 && t > 90.0 && alt_m > 42000.0) ? -6.0 : 2.0) + design.pitch_min_bias_deg;
         pitch_raw = clampd(pitch_raw, deg2rad(pitch_min_deg), deg2rad(89.4));
+        yaw_raw = clampd(yaw_raw, deg2rad(-15.0), deg2rad(15.0));
 
         const double rate_limit_deg_s =
             ((t < 35.0) ? 1.45 :
@@ -464,8 +625,11 @@ CandidateSim simulate_lvd_design(
         const double dmax = deg2rad(rate_limit_deg_s) * dt;
         pitch_cmd += clampd(pitch_raw - pitch_cmd, -dmax, dmax);
         pitch_cmd = clampd(pitch_cmd, deg2rad(pitch_min_deg), deg2rad(89.4));
+        const double yaw_dmax = deg2rad(std::max(0.75, 0.70 * rate_limit_deg_s)) * dt;
+        yaw_cmd += clampd(yaw_raw - yaw_cmd, -yaw_dmax, yaw_dmax);
+        yaw_cmd = clampd(yaw_cmd, deg2rad(-15.0), deg2rad(15.0));
 
-        const double acc_cmd = std::hypot(thrust_ax_cmd, thrust_az_cmd);
+        const double acc_cmd = std::sqrt(thrust_ax_cmd * thrust_ax_cmd + thrust_az_cmd * thrust_az_cmd + thrust_ac_cmd * thrust_ac_cmd);
         const double thrust_acc_max = thrust / std::max(1.0, s.m);
         double throttle_cmd = clampd(acc_cmd / std::max(1e-6, thrust_acc_max), 0.35, 1.0);
         const double throttle_floor =
@@ -489,6 +653,7 @@ CandidateSim simulate_lvd_design(
         if (q_kpa > request.q_limit_kpa) {
             throttle_cmd = std::min(throttle_cmd, clampd(0.90 - 0.030 * (q_kpa - request.q_limit_kpa), 0.45, 0.90));
         }
+        throttle_cmd = evaluate_throttle_model(options.throttle_model, t, throttle_cmd);
         last_throttle = throttle_cmd;
 
         if (throttle_cmd < out.stage1.min_throttle - 1e-9) {
@@ -500,32 +665,35 @@ CandidateSim simulate_lvd_design(
         const double mdot = dm / std::max(1e-9, dt);
         const double thrust_now = mdot * request.s1_isp_s * kG0;
         const double invm = 1.0 / std::max(1.0, s.m);
-        double ax = (thrust_now * std::cos(pitch_cmd)) * invm;
-        double az = (thrust_now * std::sin(pitch_cmd)) * invm - g;
-        if (air_speed > 1e-6) {
-            ax -= drag_ax;
-            az -= drag_az;
+        RpyCommand rpy_cmd = evaluate_steering_model(options.steering_model, t, {0.0, pitch_cmd, yaw_cmd});
+        Vec3 thrust_dir = thrust_dir_from_rpy(rpy_cmd, frame);
+        if (options.steering_model.type == SteeringModelType::QuaternionTable &&
+            !options.steering_model.quat_table.empty()) {
+            thrust_dir = normalize3(rotate_quat(interpolate_quat_table(options.steering_model.quat_table, t), {1.0, 0.0, 0.0}));
         }
+        const Vec3 accel = thrust_dir * (thrust_now * invm) + gravity - drag_acc;
 
-        s.vx += ax * dt;
-        s.vz += az * dt;
-        s.x += s.vx * dt;
-        s.z += s.vz * dt;
+        s.v += accel * dt;
+        s.r += s.v * dt;
         s.m -= dm;
         used += dm;
         t += dt;
-        if (s.z < 0.0) {
-            s.z = 0.0;
-            if (s.vz < 0.0) s.vz = 0.0;
+        if (altitude_m(s) < 0.0) {
+            const Vec3 rhat = normalize3(s.r);
+            s.r = rhat * kRe;
+            const double vr_surface = dot3(s.v, rhat);
+            if (vr_surface < 0.0) s.v -= rhat * vr_surface;
         }
 
         if (t - out.stage1.traj.back().t >= 1.0 || t >= burn_s - 1e-6) {
-            out.stage1.traj.push_back({t, s.x / 1000.0, std::max(0.0, s.z / 1000.0)});
-            push_sample(out.samples, s, t, q_kpa, throttle_cmd);
+            out.stage1.traj.push_back({t, downrange_m(s, orbit_target) / 1000.0, std::max(0.0, altitude_m(s) / 1000.0)});
+            out.stage1.traj3d.push_back({t, s.r, s.v});
+            push_sample(out.samples, s, orbit_target, t, q_kpa, throttle_cmd);
         }
     }
 
-    out.stage1.meco = {kRe + std::max(0.0, s.z), s.x / kRe, s.vz, s.vx, s.m};
+    out.stage1.meco = polar_from_state3d(s, orbit_target);
+    out.stage1.meco3d = {s.r, s.v, s.m, true};
     out.stage1.meco_s = t;
     out.stage1.burn_s = t;
     out.stage1.used_prop = used;
@@ -534,44 +702,37 @@ CandidateSim simulate_lvd_design(
     double coast_elapsed = 0.0;
     while (coast_elapsed < sep_delay_s - 1e-9) {
         const double dt = std::min(0.20, sep_delay_s - coast_elapsed);
-        const double alt_m = std::max(0.0, s.z);
-        const double speed = std::hypot(s.vx, s.vz);
-        const double air_vx = s.vx - atmosphere_vx;
-        const double air_vz = s.vz;
-        const double air_speed = std::hypot(air_vx, air_vz);
+        const double alt_m = std::max(0.0, altitude_m(s));
+        const Vec3 air_v = s.v - atmosphere_velocity_eci(s.r);
+        const double air_speed = norm3(air_v);
         const double dens = rho(alt_m);
-        const double g = grav(alt_m);
+        const double r_norm = std::max(1.0, norm3(s.r));
+        const Vec3 gravity = s.r * (-kMu / (r_norm * r_norm * r_norm));
         const double drag = 0.5 * dens * air_speed * air_speed * cda;
-        double drag_ax = 0.0;
-        double drag_az = 0.0;
+        Vec3 drag_acc{0.0, 0.0, 0.0};
         if (air_speed > 1e-6) {
             const double invm = 1.0 / std::max(1.0, s.m);
-            drag_ax = (drag * invm) * (air_vx / air_speed);
-            drag_az = (drag * invm) * (air_vz / air_speed);
+            drag_acc = air_v * ((drag * invm) / air_speed);
         }
-        double ax = 0.0;
-        double az = -g;
-        if (air_speed > 1e-6) {
-            ax -= drag_ax;
-            az -= drag_az;
-        }
-        s.vx += ax * dt;
-        s.vz += az * dt;
-        s.x += s.vx * dt;
-        s.z += s.vz * dt;
+        s.v += (gravity - drag_acc) * dt;
+        s.r += s.v * dt;
         t += dt;
         coast_elapsed += dt;
-        if (s.z < 0.0) {
-            s.z = 0.0;
-            if (s.vz < 0.0) s.vz = 0.0;
+        if (altitude_m(s) < 0.0) {
+            const Vec3 rhat = normalize3(s.r);
+            s.r = rhat * kRe;
+            const double vr_surface = dot3(s.v, rhat);
+            if (vr_surface < 0.0) s.v -= rhat * vr_surface;
         }
         if (t - out.stage1.traj.back().t >= 1.0 || coast_elapsed >= sep_delay_s - 1e-6) {
-            out.stage1.traj.push_back({t, s.x / 1000.0, std::max(0.0, s.z / 1000.0)});
-            push_sample(out.samples, s, t, last_q_kpa, last_throttle);
+            out.stage1.traj.push_back({t, downrange_m(s, orbit_target) / 1000.0, std::max(0.0, altitude_m(s) / 1000.0)});
+            out.stage1.traj3d.push_back({t, s.r, s.v});
+            push_sample(out.samples, s, orbit_target, t, last_q_kpa, last_throttle);
         }
     }
 
-    out.stage1.sep = {kRe + std::max(0.0, s.z), s.x / kRe, s.vz, s.vx, s.m};
+    out.stage1.sep = polar_from_state3d(s, orbit_target);
+    out.stage1.sep3d = {s.r, s.v, s.m, true};
     out.stage1.sep_s = t;
 
     const double sep_alt_km = (out.stage1.sep.r - kRe) / 1000.0;
