@@ -101,6 +101,34 @@ inline void destination_from_course(
     lon2_deg = wrap_lon_deg(rad2deg(lon2));
 }
 
+inline double direct_launch_min_incl_deg(double lat_deg) {
+    return clampd(std::abs(lat_deg), 0.0, 90.0);
+}
+
+inline double direct_launch_target_incl_deg(double lat_deg, double incl_deg) {
+    const double min_incl = direct_launch_min_incl_deg(lat_deg);
+    const double req_incl = clampd(std::abs(incl_deg), 0.0, 180.0);
+    return clampd(req_incl, min_incl, 180.0 - min_incl);
+}
+
+inline double direct_launch_sin_az(double lat_deg, double incl_deg) {
+    const double lat = deg2rad(lat_deg);
+    const double target_incl = deg2rad(direct_launch_target_incl_deg(lat_deg, incl_deg));
+    const double c_lat = std::cos(lat);
+    if (std::abs(c_lat) <= 1e-6) return 0.0;
+    return clampd(std::cos(target_incl) / c_lat, -1.0, 1.0);
+}
+
+inline double direct_launch_azimuth_deg(double lat_deg, double incl_deg) {
+    return rad2deg(std::asin(direct_launch_sin_az(lat_deg, incl_deg)));
+}
+
+inline double direct_launch_effective_incl_deg(double lat_deg, double launch_az_deg) {
+    const double lat = deg2rad(lat_deg);
+    const double az = deg2rad(launch_az_deg);
+    return rad2deg(std::acos(clampd(std::cos(lat) * std::sin(az), -1.0, 1.0)));
+}
+
 inline double prop_for_dv(double m0, double dv, double isp) {
     if (dv <= 0.0 || isp <= 1e-6 || m0 <= 1.0) return 0.0;
     const double mf = m0 / std::exp(dv / (isp * kG0));

@@ -2538,7 +2538,7 @@ void draw_state_line(HDC hdc, int x, int& y, const std::wstring& label, const st
     TextOutW(hdc, x, y, label.c_str(), static_cast<int>(label.size()));
     SetTextColor(hdc, RGB(45, 51, 58));
     TextOutW(hdc, x + 148, y, value.c_str(), static_cast<int>(value.size()));
-    y += 17;
+    y += 14;
 }
 
 void draw_spacecraft_state_panel(HDC hdc, const RECT& outer, const App& a, bool final_state) {
@@ -2563,7 +2563,10 @@ void draw_spacecraft_state_panel(HDC hdc, const RECT& outer, const App& a, bool 
         draw_state_line(hdc, in.left, y, L"UTC", utc_from_jd(req.launch_epoch_utc_jd));
         draw_state_line(hdc, in.left, y, L"Perigee Alt", fnum(req.perigee_km, 1) + L" km");
         draw_state_line(hdc, in.left, y, L"Apogee Alt", fnum(req.apogee_km, 1) + L" km");
-        draw_state_line(hdc, in.left, y, L"Inclination", fnum(req.incl_deg, 3) + L" deg");
+        const double direct_incl = falcon9::direct_launch_target_incl_deg(req.lat_deg, req.incl_deg);
+        const double direct_az = falcon9::direct_launch_azimuth_deg(req.lat_deg, req.incl_deg);
+        draw_state_line(hdc, in.left, y, L"Requested Incl", fnum(req.incl_deg, 3) + L" deg");
+        draw_state_line(hdc, in.left, y, L"Direct Plane", fnum(direct_incl, 3) + L" deg @ " + fnum(direct_az, 3) + L" deg");
         draw_state_line(hdc, in.left, y, L"Launch Site", fnum(req.lat_deg, 4) + L", " + fnum(req.launch_lon_deg, 4));
         draw_state_line(hdc, in.left, y, L"Total Mass", fnum(total_mass_kg / 1000.0, 3) + L" t");
         return;
@@ -2581,9 +2584,14 @@ void draw_spacecraft_state_panel(HDC hdc, const RECT& outer, const App& a, bool 
     draw_state_line(hdc, in.left, y, L"UTC", utc_from_jd(req.launch_epoch_utc_jd + a.plan.stage2.cutoff_s / 86400.0));
     draw_state_line(hdc, in.left, y, L"Perigee Alt", fnum(a.plan.stage2.orbit.rp_km, 1) + L" km");
     draw_state_line(hdc, in.left, y, L"Apogee Alt", fnum(a.plan.stage2.orbit.ra_km, 1) + L" km");
+    draw_state_line(
+        hdc,
+        in.left,
+        y,
+        L"Inclination",
+        fnum(falcon9::direct_launch_effective_incl_deg(req.lat_deg, a.plan.orbit_target.launch_az_deg), 3) + L" deg");
     draw_state_line(hdc, in.left, y, L"Eccentricity", fnum(a.plan.stage2.orbit.e, 6));
     draw_state_line(hdc, in.left, y, L"RAAN", fnum(a.plan.lvd_launch_raan_deg, 3) + L" deg");
-    draw_state_line(hdc, in.left, y, L"FPA", fnum(a.plan.stage2.orbit.flight_path_deg, 3) + L" deg");
     draw_state_line(hdc, in.left, y, L"Total Mass", fnum(final_mass_kg / 1000.0, 3) + L" t");
 }
 

@@ -41,6 +41,32 @@ std::wstring ftime(double s) {
     return oss.str();
 }
 
+void append_orbit_target_report(
+    std::vector<std::wstring>& lines,
+    const MissionRequest& request,
+    const OrbitTarget& target) {
+    const double min_direct_incl = direct_launch_min_incl_deg(request.lat_deg);
+    const double max_direct_incl = 180.0 - min_direct_incl;
+    const double direct_incl = direct_launch_effective_incl_deg(request.lat_deg, target.launch_az_deg);
+    const double requested_incl = clampd(std::abs(request.incl_deg), 0.0, 180.0);
+
+    lines.push_back(
+        L"[Orbit Target] rp=" + fnum(target.rp_km, 1) +
+        L" km, ra=" + fnum(target.ra_km, 1) +
+        L" km, cutoff=" + fnum(target.cutoff_alt_km, 1) +
+        L" km, requested_i=" + fnum(request.incl_deg, 2) +
+        L" deg, direct_i=" + fnum(direct_incl, 2) +
+        L" deg, launch_az=" + fnum(target.launch_az_deg, 2) + L" deg");
+
+    if (requested_incl < min_direct_incl - 1e-6 || requested_incl > max_direct_incl + 1e-6) {
+        lines.push_back(
+            L"[Orbit Target] requested inclination is outside the direct-launch range " +
+            fnum(min_direct_incl, 2) + L".." + fnum(max_direct_incl, 2) +
+            L" deg for launch latitude " + fnum(request.lat_deg, 2) +
+            L" deg; using the nearest direct plane.");
+    }
+}
+
 double local_circular_speed(double alt_km) {
     return std::sqrt(kMu / std::max(1.0, kRe + alt_km * 1000.0));
 }
@@ -104,10 +130,8 @@ Stage1Result simulate_stage1_candidate(
     FlatState s;
     {
         const double lat = deg2rad(request.lat_deg);
-        const double inc = deg2rad(std::abs(request.incl_deg));
         const double c_lat = std::cos(lat);
-        double sin_az = 0.0;
-        if (std::abs(c_lat) > 1e-6) sin_az = clampd(std::cos(inc) / c_lat, -1.0, 1.0);
+        const double sin_az = direct_launch_sin_az(request.lat_deg, request.incl_deg);
         const double vrot = kOmega * kRe * c_lat;
         s.vx = vrot * std::max(0.0, sin_az);
     }
@@ -1162,10 +1186,8 @@ Stage1Result clip_stage1_from_lvd(
     double atmosphere_vx = 0.0;
     {
         const double lat = deg2rad(request.lat_deg);
-        const double inc = deg2rad(std::abs(request.incl_deg));
         const double c_lat = std::cos(lat);
-        double sin_az = 0.0;
-        if (std::abs(c_lat) > 1e-6) sin_az = clampd(std::cos(inc) / c_lat, -1.0, 1.0);
+        const double sin_az = direct_launch_sin_az(request.lat_deg, request.incl_deg);
         atmosphere_vx = kOmega * kRe * c_lat * std::max(0.0, sin_az);
     }
 
@@ -1618,14 +1640,7 @@ OrbitTarget build_orbit_target(const MissionRequest& request) {
         out.rp_km,
         out.ra_km);
 
-    const double lat = deg2rad(request.lat_deg);
-    const double inc = deg2rad(std::abs(request.incl_deg));
-    const double c_lat = std::cos(lat);
-    double sin_az = 0.0;
-    if (std::abs(c_lat) > 1e-6) {
-        sin_az = clampd(std::cos(inc) / c_lat, -1.0, 1.0);
-    }
-    out.launch_az_deg = rad2deg(std::asin(sin_az));
+    out.launch_az_deg = direct_launch_azimuth_deg(request.lat_deg, request.incl_deg);
 
     const double rp = kRe + out.rp_km * 1000.0;
     const double ra = kRe + out.ra_km * 1000.0;
@@ -1857,11 +1872,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
         result.payload_search_ok = false;
         result.ok = false;
         result.lines.push_back(L"[Status] " + result.status);
-        result.lines.push_back(
-            L"[Orbit Target] rp=" + fnum(result.orbit_target.rp_km, 1) +
-            L" km, ra=" + fnum(result.orbit_target.ra_km, 1) +
-            L" km, cutoff=" + fnum(result.orbit_target.cutoff_alt_km, 1) +
-            L" km, i=" + fnum(request.incl_deg, 2) + L" deg");
+        append_orbit_target_report(result.lines, request, result.orbit_target);
         result.lines.push_back(L"[Reserve Fuel] Stage1=N/A kg, Stage2=N/A kg");
         result.lines.push_back(L"[Reserve Objective] maximize Stage2 remaining propellant = N/A");
         if (recovery_required) {
@@ -1916,11 +1927,7 @@ MissionResult solve_mission(const MissionRequest& request_in, SolveControl contr
     const double sep_gamma = rad2deg(std::atan2(result.stage1.sep.vr, std::max(1.0, result.stage1.sep.vt)));
 
     result.lines.push_back(L"[Status] " + result.status);
-    result.lines.push_back(
-        L"[Orbit Target] rp=" + fnum(result.orbit_target.rp_km, 1) +
-        L" km, ra=" + fnum(result.orbit_target.ra_km, 1) +
-        L" km, cutoff=" + fnum(result.orbit_target.cutoff_alt_km, 1) +
-        L" km, i=" + fnum(request.incl_deg, 2) + L" deg");
+    append_orbit_target_report(result.lines, request, result.orbit_target);
     if (!recovery_required) {
         result.lines.push_back(L"[Mode] No recovery; Stage1 burns to depletion before separation.");
     }
