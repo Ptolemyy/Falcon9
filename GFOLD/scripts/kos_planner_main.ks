@@ -427,6 +427,9 @@ WRITE_KVS("mass_unit_note", "ksp_ton_to_kg_x1000").
 
 WRITE_KV("lat_deg", LAT_DEG).
 WRITE_KV("launch_lon_deg", LON_DEG).
+SET EARTH_ROTATION_ANGLE_DEG TO (TIME:SECONDS * 360 / SHIP:BODY:ROTATIONPERIOD).
+WRITE_KV("earth_rotation_angle_deg", EARTH_ROTATION_ANGLE_DEG).
+WRITE_KV("launch_window_half_width_min", 45).
 WRITE_KV("ship_downrange_km", SHIP_DOWNRANGE_KM).
 WRITE_KV("losses_mps", ASCENT_LOSSES_MPS).
 WRITE_KV("q_limit_kpa", MAX_Q_LIMIT_KPA).

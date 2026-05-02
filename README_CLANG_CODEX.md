@@ -1,5 +1,54 @@
 # Clang / ClangCL + Codex Build Guide
 
+## Falcon9 Current Build
+
+This repository currently builds cleanly as a Windows C++17 CMake project with Ninja and the Visual Studio Build Tools Clang frontend.
+
+The active local build cache in `build/` uses:
+
+- generator: `Ninja`
+- build type: `Debug`
+- compiler: `C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang.exe`
+- output: `build/falcon9_gui_planner.exe`
+
+Configure the same Clang/Ninja build from the repository root:
+
+```powershell
+cmake -S . -B build -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DCMAKE_CXX_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang.exe"
+```
+
+Build:
+
+```powershell
+cmake --build build --target falcon9_gui_planner
+```
+
+Run:
+
+```powershell
+.\build\falcon9_gui_planner.exe
+```
+
+For a separate Release build, use a fresh directory so Debug and Release caches do not get tangled:
+
+```powershell
+cmake -S . -B build-clang-release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_CXX_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang.exe"
+
+cmake --build build-clang-release
+.\build-clang-release\falcon9_gui_planner.exe
+```
+
+CMake copies the runtime data into the build directory during configure:
+
+- `falcon9_real_defaults.txt`
+- `assets/earth_blue_marble.bmp`
+
+If the executable starts but the Earth texture is missing, re-run configure or check that `<build-dir>/assets/earth_blue_marble.bmp` exists.
+
 This file is a reusable guide for asking Codex to configure and build C/C++ projects with Clang.
 
 It is written for a Windows + CMake + VS Code workflow first, because that is the setup that caused the least friction in this project.
@@ -128,7 +177,9 @@ find_package(pybind11 REQUIRED)
 
 ## Standard Commands
 
-Configure:
+For this Falcon9 project, prefer the Clang/Ninja commands above.
+
+For projects using the Visual Studio generator with ClangCL, configure:
 
 ```powershell
 cmake --preset clangcl-x64
@@ -147,6 +198,20 @@ cmake --build --preset release
 ```
 
 ## Common Failure Patterns
+
+### 0. Ninja single-config path is mistaken for Visual Studio path
+
+Cause:
+
+- Ninja writes executables directly under `build/`
+- Visual Studio writes executables under `build/Release/` or `build/Debug/`
+- old docs or old generated files point to `build/Release/`
+
+Fix:
+
+- for Ninja, run `.\build\falcon9_gui_planner.exe`
+- for Visual Studio, run `.\build-vs\Release\falcon9_gui_planner.exe`
+- avoid using stale executables left in an old `Release` folder
 
 ### 1. Python is 64-bit, chosen compiler is 32-bit
 

@@ -59,6 +59,19 @@ inline double wrap_lon_deg(double lon_deg) {
     return out;
 }
 
+inline double wrap360_deg(double deg) {
+    double out = std::fmod(deg, 360.0);
+    if (out < 0.0) out += 360.0;
+    return out;
+}
+
+inline double angle_diff_deg(double a, double b) {
+    double d = wrap360_deg(a) - wrap360_deg(b);
+    while (d > 180.0) d -= 360.0;
+    while (d < -180.0) d += 360.0;
+    return d;
+}
+
 inline void destination_from_course(
     double lat1_deg,
     double lon1_deg,
@@ -138,6 +151,10 @@ struct MissionRequest {
     double incl_deg = 28.5;
     double lat_deg = 28.5;
     double launch_lon_deg = -80.6;
+    double earth_rotation_angle_deg = 0.0;
+    double target_raan_deg = std::numeric_limits<double>::quiet_NaN();
+    double launch_epoch_utc_jd = std::numeric_limits<double>::quiet_NaN();
+    double launch_window_half_width_min = 45.0;
     double ship_downrange_km = 620.0;
     double losses_mps = 1500.0;
     double q_limit_kpa = 45.0;
@@ -275,6 +292,34 @@ struct RecoveryResult {
     std::vector<SimPt> landing_traj;
 };
 
+struct LvdEvent {
+    std::wstring name;
+    double t_s = 0.0;
+    double alt_km = 0.0;
+    double downrange_km = 0.0;
+    double speed_mps = 0.0;
+    double flight_path_deg = 0.0;
+    double q_kpa = 0.0;
+    double throttle = 0.0;
+    double mass_kg = 0.0;
+};
+
+struct LaunchWindowSample {
+    double offset_s = 0.0;
+    double earth_rotation_angle_deg = 0.0;
+    double launch_raan_deg = 0.0;
+    double plane_error_deg = 0.0;
+    double score = std::numeric_limits<double>::infinity();
+    bool in_window = false;
+};
+
+struct LvdStateSample {
+    double t_s = 0.0;
+    PolarState state;
+    double q_kpa = 0.0;
+    double throttle = 0.0;
+};
+
 struct SeparationCandidate {
     double sep_time_s = 0.0;
     double sep_alt_target_km = 0.0;
@@ -296,10 +341,19 @@ struct MissionResult {
     std::vector<std::wstring> lines;
     std::vector<Series> profile_series;
     std::vector<Series> separation_time_series;
+    std::vector<Series> lvd_time_series;
     std::vector<SeparationCandidate> separation_candidates;
+    std::vector<LvdEvent> lvd_events;
+    std::vector<LaunchWindowSample> launch_window_samples;
     std::vector<GlobeSeries> globe_series;
     double launch_lat_deg = 0.0;
     double launch_lon_deg = -80.6;
+    double launch_epoch_utc_jd = std::numeric_limits<double>::quiet_NaN();
+    double lvd_launch_offset_s = 0.0;
+    double lvd_earth_rotation_angle_deg = 0.0;
+    double lvd_launch_raan_deg = 0.0;
+    double lvd_target_raan_deg = std::numeric_limits<double>::quiet_NaN();
+    double lvd_plane_error_deg = 0.0;
     double ship_lat_deg = 0.0;
     double ship_lon_deg = -80.0;
     double view_lat_deg = 20.0;

@@ -11,6 +11,14 @@ incl_deg=28.5
 
 lat_deg=28.561857
 launch_lon_deg=-80.577366
+# UTC window center. The planner converts this to Greenwich sidereal angle
+# and uses it as the launch-window reference epoch.
+launch_utc=2026-05-01T00:00:00Z
+# Used only when launch_utc is omitted.
+earth_rotation_angle_deg=0
+# Optional inertial target node for LVD launch-window search. NaN/omitted means "use current rotation".
+# target_raan_deg=0
+launch_window_half_width_min=45
 ship_downrange_km=620
 losses_mps=1500
 q_limit_kpa=45

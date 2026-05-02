@@ -121,7 +121,8 @@ void print_result(const Scenario& s, const falcon9::MissionResult& r) {
 
 bool payload_positive_margin(const falcon9::MissionResult& result) {
     return falcon9::mission_payload_search_ok(result) &&
-           result.recovery.margin_kg > 0.0;
+           result.recovery.feasible &&
+           result.recovery.margin_kg >= -1e-3;
 }
 
 void run_max_payload_smoke(Scenario s) {
@@ -166,17 +167,26 @@ void run_max_payload_smoke(Scenario s) {
     }
 
     for (double step_kg : coarse_steps) {
+        int consecutive_failures = 0;
+        double local_first_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
         while (true) {
-            const double raw_probe_payload_kg = best_payload_kg + step_kg;
+            const double raw_probe_payload_kg = best_payload_kg + step_kg * static_cast<double>(consecutive_failures + 1);
             const double probe_payload_kg = std::min(raw_probe_payload_kg, payload_cap_kg);
             const bool capped_probe = raw_probe_payload_kg > payload_cap_kg + 1e-6;
             falcon9::MissionResult probe = eval_payload(probe_payload_kg);
             if (!payload_positive_margin(probe)) {
-                first_fail_payload_kg = probe_payload_kg;
-                break;
+                if (!std::isfinite(local_first_fail_payload_kg)) local_first_fail_payload_kg = probe_payload_kg;
+                ++consecutive_failures;
+                if (consecutive_failures >= 3 || capped_probe) {
+                    first_fail_payload_kg = local_first_fail_payload_kg;
+                    break;
+                }
+                continue;
             }
             best_payload_kg = probe_payload_kg;
             best = std::move(probe);
+            consecutive_failures = 0;
+            local_first_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
             if (capped_probe) {
                 hit_search_cap = true;
                 break;
@@ -186,17 +196,26 @@ void run_max_payload_smoke(Scenario s) {
         if (hit_search_cap) break;
     }
 
+    int consecutive_final_failures = 0;
+    double local_first_final_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
     while (true) {
-        const double raw_probe_payload_kg = best_payload_kg + kFinalStepKg;
+        const double raw_probe_payload_kg = best_payload_kg + kFinalStepKg * static_cast<double>(consecutive_final_failures + 1);
         const double probe_payload_kg = std::min(raw_probe_payload_kg, payload_cap_kg);
         const bool capped_probe = raw_probe_payload_kg > payload_cap_kg + 1e-6;
         falcon9::MissionResult probe = eval_payload(probe_payload_kg);
         if (!payload_positive_margin(probe)) {
-            first_fail_payload_kg = probe_payload_kg;
-            break;
+            if (!std::isfinite(local_first_final_fail_payload_kg)) local_first_final_fail_payload_kg = probe_payload_kg;
+            ++consecutive_final_failures;
+            if (consecutive_final_failures >= 3 || capped_probe) {
+                first_fail_payload_kg = local_first_final_fail_payload_kg;
+                break;
+            }
+            continue;
         }
         best_payload_kg = probe_payload_kg;
         best = std::move(probe);
+        consecutive_final_failures = 0;
+        local_first_final_fail_payload_kg = std::numeric_limits<double>::quiet_NaN();
         if (capped_probe) {
             hit_search_cap = true;
             break;

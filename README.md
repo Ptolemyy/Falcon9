@@ -2,7 +2,7 @@
 
 This project is a Windows C++ GUI mission planner for:
 
-- Launch ascent (simplified 3DOF-inspired propagation)
+- Launch ascent (event-based C++ LVD-style stage-1 reference propagation)
 - Stage-1 separation and sea-recovery budget
 - Stage-2 orbit insertion budget
 
@@ -20,21 +20,18 @@ Vehicle/stage/payload/launch parameters are loaded from `send.txt` config.
 - `Import Default Falcon9 Config` button to load default vehicle values from the UI
 - `<` / `>` candidate buttons to inspect stored separation-time candidates in the trajectory and globe views
 - Mission report list with timeline and feasibility checks
-- Stage-1 separation is auto-optimized (no manual sep altitude/speed tuning required)
+- Stage-1 LVD is solved once per payload with a mission-scored direct search over SEP targets plus steering/throttle node parameters, then separation time is searched by clipping the LVD reference trajectory
 - Droneship downrange is set to Stage-1 ballistic impact prediction (with atmospheric drag)
-- Stage-1 ascent guidance uses a constrained UPFG-like Falcon 9 / Starlink-style ascent law (simplified 2D implementation)
+- Stage-1 ascent uses a C++ LVD-style event model with launch-window/planet-rotation inputs
 - Stage-2 orbit insertion uses propagated UPFG-like guidance instead of a Bezier approximation
-- 2D trajectory profile view:
-  - Stage-1 ascent
-  - Stage-1 sea recovery path
-  - Stage-2 orbit injection path
-- 3D whole-Earth view (orthographic projection):
-  - Earth sphere with latitude/longitude grid
+- Single-window DISPLAY view:
+  - Blue Marble Earth texture with atmosphere-style rim
   - Mission trajectories projected around Earth
   - Post-insertion Stage-2 orbit track around Earth
   - Launch site and droneship markers
 - Mouse drag rotation of globe view
-- Separate sweep charts window for Stage-2 remaining fuel, landing margin, and landing propellant
+- In-window sweep charts for Stage-2 remaining fuel, landing margin, and landing propellant
+- In-window LVD events and launch-window diagnostics
 
 - Separate communication bridge executable:
   - waits for `send.txt`
@@ -47,41 +44,68 @@ Requirements:
 
 - Windows
 - CMake >= 3.16
-- Visual Studio C++ toolchain
+- Visual Studio Build Tools or Visual Studio C++ toolchain
+- Windows SDK
+- Ninja is recommended for the current Clang build
 
-Commands (from repository root):
+Current Clang/Ninja build used in this workspace:
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Release
+cmake -S . -B build -G Ninja `
+  -DCMAKE_BUILD_TYPE=Debug `
+  -DCMAKE_CXX_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang.exe"
+
+cmake --build build --target falcon9_gui_planner
 ```
 
-Executable:
+Release Clang/Ninja build in a clean directory:
 
-`build/Release/falcon9_gui_planner.exe`
+```powershell
+cmake -S . -B build-clang-release -G Ninja `
+  -DCMAKE_BUILD_TYPE=Release `
+  -DCMAKE_CXX_COMPILER="C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/Llvm/x64/bin/clang.exe"
 
-`build/Release/planner_comm_bridge.exe`
+cmake --build build-clang-release
+```
+
+Visual Studio generator still works, but it is multi-config and writes executables under the selected configuration folder:
+
+```powershell
+cmake -S . -B build-vs -G "Visual Studio 17 2022" -A x64
+cmake --build build-vs --config Release
+```
+
+Executable locations:
+
+- Ninja single-config: `build/falcon9_gui_planner.exe`
+- Ninja release example: `build-clang-release/falcon9_gui_planner.exe`
+- Visual Studio multi-config: `build-vs/Release/falcon9_gui_planner.exe`
+
+During configure, CMake copies:
+
+- `config/falcon9_real_defaults.txt` -> `<build-dir>/falcon9_real_defaults.txt`
+- `assets/earth_blue_marble.bmp` -> `<build-dir>/assets/earth_blue_marble.bmp`
 
 ## Run
 
 ```powershell
-.\build\Release\falcon9_gui_planner.exe
+.\build\falcon9_gui_planner.exe
 ```
 
 When started without `--vehicle-config`, the planner will try to auto-load:
 
-`build/Release/falcon9_real_defaults.txt` (copied from `config/falcon9_real_defaults.txt` during build)
+`<build-dir>/falcon9_real_defaults.txt` (copied from `config/falcon9_real_defaults.txt` during configure)
 
 Load vehicle config from file:
 
 ```powershell
-.\build\Release\falcon9_gui_planner.exe --vehicle-config .\send.txt
+.\build\falcon9_gui_planner.exe --vehicle-config .\send.txt
 ```
 
 Run communication bridge (separate cpp):
 
 ```powershell
-.\build\Release\planner_comm_bridge.exe .\send.txt .\build\Release\falcon9_gui_planner.exe 120
+.\build\planner_comm_bridge.exe .\send.txt .\build\falcon9_gui_planner.exe 120
 ```
 
 - arg1: send file path
@@ -106,6 +130,9 @@ s2_ignition_delay_s=7
 s2_target_seco_s=529
 lat_deg=28.5
 launch_lon_deg=-80.6
+launch_utc=2026-05-01T00:00:00Z
+# earth_rotation_angle_deg=0
+launch_window_half_width_min=45
 ship_downrange_km=620
 q_limit_kpa=45
 s1_target_maxq_kpa=35

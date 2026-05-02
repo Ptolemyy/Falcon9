@@ -198,6 +198,33 @@ So the ascent search is coupled to the propagated stage-2 solver:
 4. recovery reserve evaluation
 5. final candidate ranking
 
+## Current Repo Behavior
+
+The current implementation in this repository follows this practical sequence:
+
+1. `MissionRequest` is sanitized first. UTC launch time is converted to Earth rotation / launch-window geometry before the ascent search is evaluated.
+2. Stage 1 starts from site latitude and includes the rotational velocity component available for the requested inclination.
+3. Early ascent uses a time/altitude pitch backbone with an explicit Max-Q throttle bucket.
+4. Normal recoverable missions cap usable stage-1 propellant by the configured stage-1 reserve ratio. The cap is bypassed only for explicit burnout / no-recovery modes.
+5. Late stage-1 ascent uses a terminal correction layer toward separation altitude, speed, and flight-path angle. This layer is deliberately not a full stage-1 UPFG handoff because preserving recovery margin and avoiding overly lofted separation are more important in the current 2D planner.
+6. Every candidate stage-1 separation is propagated through the real stage-2 solver before ranking. A separation that looks good by altitude/speed alone is not accepted if stage 2 cannot insert accurately.
+7. Stage 2 uses blended terminal UPFG guidance, adaptive terminal step size, and a continuous orbit-error penalty. The stage-1 search therefore sees actual insertion miss distance instead of an idealized delta-v estimate.
+8. Separation-time samples can be evaluated in parallel. Max-payload mode also uses a parallel coarse payload sweep before the final fine search.
+9. Candidate ranking prefers feasible orbit insertion and recovery first, then uses remaining stage-2 propellant, stage-1 reserve, Max-Q excess, and separation-state error as secondary terms.
+
+In short, the liftoff algorithm is now a coupled mission planner:
+
+```text
+UTC / target orbit
+  -> stage-1 pitch + throttle candidate
+  -> separation state
+  -> propagated stage-2 UPFG insertion
+  -> propagated stage-1 recovery
+  -> candidate ranking
+```
+
+This is intentionally more conservative than a pure single-stage guidance law, but more useful for payload and recovery trade studies.
+
 ## What This Algorithm Is Not
 
 This ascent law is not:
@@ -222,7 +249,9 @@ In the current planner, the intended implementation behavior is:
 3. terminal correction shapes separation state late,
 4. stage-separation flight-path angle is actively driven downward to avoid an overly lofted stage-2 injection,
 5. stage-2 insertion is propagated and fed back into stage-1 burn search,
-6. max-payload mode prioritizes reducing unnecessary stage-1 reserve.
+6. stage-2 UPFG is used as a terminal insertion correction rather than a replacement for the whole ascent profile,
+7. max-payload mode prioritizes reducing unnecessary stage-1 reserve,
+8. launch-window calculations are UTC-driven when a UTC epoch is provided in the vehicle configuration.
 
 ## Acceptance Criteria
 
